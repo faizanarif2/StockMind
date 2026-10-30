@@ -38,12 +38,13 @@ def fetch_historical_prices(
     if not ticker:
         raise ValueError("Ticker cannot be empty.")
 
-    # Keep psxdata caching enabled.
+    # StockMind caches responses itself (see cache.py), so psxdata's
+    # separate cache in ~/.psxdata is disabled to avoid two copies.
     df = psxdata.stocks(
         ticker,
         start=start,
         end=end,
-        cache=True,
+        cache=False,
     )
 
     if df.empty:
@@ -62,4 +63,5 @@ def fetch_historical_prices(
             f"Missing columns: {sorted(missing_columns)}"
         )
 
-    return df
+    # PSX returns newest rows first; downstream code expects oldest first.
+    return df.sort_values("date").reset_index(drop=True)
