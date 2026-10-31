@@ -49,7 +49,60 @@ News collection for the Sentiment Agent will be added later.
 
 **Scaling to more companies.** Nothing in the code assumes five companies. To support more, add their symbols to `SUPPORTED_TICKERS` in `config.py`. Peers are found automatically from the PSX sector listing, and every source is fetched and cached per symbol, so a company that is both supported and a peer is fetched only once. `DataCollectionAgent().collect_many()` collects all supported companies in one call.
 
-Technical, fundamental, sentiment, risk, and decision-making agents will be developed in later stages.
+### Agent 3 - Fundamental Analysis Agent (implemented)
+
+`src/stockmind/agents/fundamental_analysis.py` judges how financially healthy a company is, compares it with its sector, and returns a signal for the Decision Agent:
+
+```text
+OGDC: BUY (50% confidence, health 62/100)
+  - P/E ratio is 5.44x, below the sector median of 5.66x (similar); strong on its own.
+  - Return on equity is 16.0%, below the sector median of 28.8% (worse); average on its own.
+  ...
+```
+
+It only calculates from Agent 1's `CompanyData`. It fetches nothing, so it runs in milliseconds.
+
+**Ratios.** These are calculated in `analysis/ratios.py` from the consolidated statements, for the latest period: TTM if the company has reported quarters since its year end, otherwise the latest fiscal year. The balance sheet is taken at the same date.
+
+| Ratio | Formula | Weight |
+|---|---|---|
+| P/E | latest close / EPS (a company with no profit scores -1) | 0.20 |
+| Return on equity | net income to common / common equity | 0.20 |
+| EPS growth | EPS vs the previous 12 months | 0.15 |
+| Revenue growth | revenue vs the previous 12 months | 0.15 |
+| Net profit margin | net income / revenue | 0.10 |
+| Debt-to-equity | total debt / equity (not used for banks) | 0.10 |
+| Price-to-book | latest close / book value per share | 0.05 |
+| Dividend yield | cash dividends with an ex-date in the last 12 months / price | 0.05 |
+| EPS, 3-year revenue growth | shown for context, not scored | — |
+
+**Industry comparison.** The same ratios are calculated for every sector peer from Agent 1. The industry benchmark is the peers' median, not their mean, so one outlier cannot distort it. Peers whose statements are more than ~18 months older than the company's are left out (e.g. KEL for HUBC). With fewer than 2 usable peers, only the absolute benchmarks are used and a warning is attached.
+
+**Signal and confidence.** These are defined in the module docstring so results are reproducible:
+
+1. Each ratio scores -1 (weak) to +1 (strong): the average of an absolute score from fixed benchmarks and an industry score from its gap to the sector median.
+2. Overall score = weighted average. A score of +0.2 or more gives **BUY**, -0.2 or less gives **SELL**, anything in between gives **HOLD**. Each ratio also votes with the same rule.
+3. `confidence = 100 × coverage × (agreement + strength) / 2`. Coverage is the share of the weight whose ratio could be calculated, and agreement is the share that votes with the final signal. Strength measures how clear the signal is: for BUY or SELL it is how far the score is from 0, and for HOLD how close it is to 0.
+4. Health score = 50 × (score + 1), from 0 to 100.
+
+Weights, benchmarks, and thresholds are all in `config.py` (`FUNDAMENTAL_METRICS` and the settings below it).
+
+```python
+from stockmind.agents.data_collection import DataCollectionAgent
+from stockmind.agents.fundamental_analysis import FundamentalAnalysisAgent
+
+result = FundamentalAnalysisAgent().analyse(DataCollectionAgent().collect("OGDC"))
+result.signal        # "BUY", "HOLD" or "SELL"
+result.confidence    # 0-100
+result.health_score  # 0-100
+result.summary       # plain-English overview
+result.explanation   # one sentence per ratio
+result.metrics       # DataFrame: value, peer_median, scores, weight, vote, comment
+result.peer_ratios   # the same ratios for each peer
+result.warnings      # e.g. peers left out, ratios that could not be calculated
+```
+
+Technical, sentiment, risk, and decision-making agents will be developed in later stages.
 
 ## Technology Stack
 
@@ -69,7 +122,10 @@ StockMind/
 │   └── stockmind/
 │       ├── config.py              # supported tickers, cache settings
 │       ├── agents/
-│       │   └── data_collection.py # Agent 1
+│       │   ├── data_collection.py # Agent 1
+│       │   └── fundamental_analysis.py # Agent 3
+│       ├── analysis/
+│       │   └── ratios.py          # P/E, ROE, growth, margins from statements
 │       └── data/
 │           ├── tickers.py         # ticker validation (e.g. HUBCXD -> HUBC)
 │           ├── fetcher.py         # price history (psxdata)
@@ -80,6 +136,7 @@ StockMind/
 │           └── cache.py           # automatic response cache
 ├── scripts/
 │   ├── collect_data.py            # run Agent 1 and print a summary
+│   ├── analyse_fundamentals.py    # run Agents 1 + 3 and print the signal
 │   └── kmi30_weights.py           # current KMI-30 ranking
 ├── tests/
 ├── .gitignore
@@ -129,6 +186,8 @@ If `python` opens the Microsoft Store on Windows, use `py` instead (e.g. `py -m 
 python scripts/collect_data.py          # all supported companies
 python scripts/collect_data.py OGDC     # one company
 python scripts/collect_data.py --force  # ignore the cache, fetch live
+python scripts/analyse_fundamentals.py       # fundamental signal, all companies
+python scripts/analyse_fundamentals.py MEBL  # one company
 python -m pytest
 ```
 
@@ -164,8 +223,10 @@ Unusual values will not automatically be treated as errors because genuine marke
 ## Development Status
 
 - Done: Agent 1 (prices, profile, financial statements, ratios, dividends) with on-demand fetching, caching, and automated tests.
-- Next: Technical Analysis Agent.
-- Later: news collection, Fundamental, Sentiment, Decision, Risk, and Learning agents, and the web application.
+- Done: Agent 3 (fundamental ratios, sector comparison, Buy/Hold/Sell signal with confidence and explanation) with automated tests.
+- In progress: Technical Analysis Agent (Agent 2).
+- Next: Decision Agent v1 (combines Agents 2 and 3) and the basic web application.
+- Later: news collection, Sentiment, Risk, and Learning agents.
 
 ## Known Data Limitations
 
@@ -174,6 +235,8 @@ Unusual values will not automatically be treated as errors because genuine marke
 - ENGROH has no payout announcements on PSX since it was renamed from Dawood Hercules (DAWH). `dividend_history` still shows DAWH-era dividends (2019-2024), because it is the same listed company.
 - `dividend_history` can include upcoming ex-dates that have been announced but not yet reached.
 - Blank or "-" cells at the source are left missing rather than set to zero.
-- Peers follow PSX's own sector classification. ENGROH is a holding company, but PSX places it under "Inv. Banks / Inv. Cos. / Securities Cos.", so its peers (e.g. PSX, DLL, IMS) are a weak comparison. Small sectors can have fewer than 4 peers (OGDC has 3).
+- Peers follow PSX's own sector classification. ENGROH is a holding company, but PSX places it under "Inv. Banks / Inv. Cos. / Securities Cos.", so its peers (e.g. PIAHCLA, DLL, PSX, IMS) are a weak comparison, and its fundamental signal should be read with that in mind. Small sectors can have fewer than 4 peers (OGDC has 3).
+- stockanalysis.com's TTM `dividend_per_share` can be incomplete (e.g. MEBL shows 7.00 while 29.50 was paid in the last 12 months). Agent 3 therefore takes the company's dividend yield from `dividend_history` and peers' yields from PSX.
+- Year-on-year growth can be extreme when the previous year was unusually small. Some power producers' revenue grew over 200%, which makes HUBC's revenue growth look weak next to the sector median. The weights keep any single ratio from deciding the signal.
 - Peer averages can be distorted by one outlier (e.g. a very high P/E when earnings are tiny). Use the median for industry comparisons.
 - stockanalysis.com is a third-party website. If it changes its page layout, only `stockanalysis.py` needs updating.
