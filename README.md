@@ -51,6 +51,55 @@ News collection for the Sentiment Agent will be added later.
 
 Technical, fundamental, sentiment, risk, and decision-making agents will be developed in later stages.
 
+### Agent 2 - Technical Analysis Agent (implemented)
+
+`src/stockmind/agents/technical_analysis.py` reads what the share price is doing (trend, momentum, overbought/oversold) and returns a signal for the Decision Agent. Its result has the same shape and the same signal and confidence rules as Agent 3's, so the two can be combined directly:
+
+```text
+MEBL: BUY (65% confidence, technical score 68/100)
+  - The 50-day SMA (PKR 547.20) is 6.3% above the 200-day SMA (PKR 514.70): long-term uptrend (bullish).
+  - RSI (14) is 68.0, close to the overbought level of 70 (bearish).
+  ...
+```
+
+It only calculates from Agent 1's prices and fetches nothing, so it runs in milliseconds.
+
+**Indicators.** These are in `analysis/indicators.py`: SMA 50 and 200, EMA 20, RSI 14 (Wilder), MACD (12, 26, 9), and Bollinger Bands (20, 2). They use the standard formulas, and `tests/test_indicators.py` checks every value against the `ta` library. They match exactly on 10 years of prices for all 5 companies (proposal criterion 6.2).
+
+**Bonus shares.** PSX prices are not adjusted for bonus issues, so a 10% bonus looks like a 9% crash. `analysis/price_adjustments.py` divides prices before the ex-date by the bonus factor. On PSX, the ex-date is the last trading day before book closure starts. Right issues are not adjusted and produce a warning.
+
+| Signal | Bullish when | Weight |
+|---|---|---|
+| Long-term trend | 50-day SMA above 200-day SMA (5% gap = full score) | 0.20 |
+| Price vs 50-day SMA | price above it (5% = full) | 0.15 |
+| Price vs 20-day EMA | price above it (3% = full) | 0.15 |
+| MACD momentum | MACD above its signal line (gap of 1% of price = full) | 0.20 |
+| RSI (14) | 30 or below, oversold. 70 or above is overbought (bearish); 40-60 is neutral | 0.15 |
+| Bollinger Bands | price at or below the lower band. At or above the upper band is bearish | 0.15 |
+
+Trend signals follow the market, while RSI and Bollinger Bands expect a reversal. When they disagree, for example a stock in a steep fall that is also oversold, confidence goes down instead of giving a confident signal.
+
+**Signal and confidence.** These use the same rules as Agent 3. A score of +0.2 or more gives BUY, -0.2 or less gives SELL, and anything in between gives HOLD. `confidence = 100 × coverage × (agreement + strength) / 2`, and technical score = 50 × (score + 1). Signals that cannot be calculated, such as SMA 200 with under 200 days of history, are skipped, which lowers coverage. Weights, scales, and thresholds are in `config.py` (`TECHNICAL_SIGNALS` and the settings around it).
+
+```python
+from stockmind.agents.data_collection import DataCollectionAgent
+from stockmind.agents.technical_analysis import TechnicalAnalysisAgent
+
+result = TechnicalAnalysisAgent().analyse(DataCollectionAgent().collect("OGDC"))
+result.signal           # "BUY", "HOLD" or "SELL"
+result.confidence       # 0-100
+result.technical_score  # 0-100
+result.trend            # "uptrend", "downtrend", "sideways" or "unknown"
+result.summary          # plain-English overview
+result.explanation      # one sentence per signal
+result.signals          # DataFrame: value, reference, score, weight, vote, comment
+result.indicators       # every indicator for every day, for charts
+result.adjustments      # bonus-share adjustments applied
+result.warnings
+```
+
+Run it with `python scripts/analyse_technicals.py`, or `python scripts/analyse_technicals.py OGDC` for one company.
+
 ## Technology Stack
 
 - Python
