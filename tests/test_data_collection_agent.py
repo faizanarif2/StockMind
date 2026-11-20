@@ -204,3 +204,17 @@ def test_unsupported_ticker_is_rejected_before_any_fetch(calls, agent):
 )
 def test_resolve_ticker(raw, expected):
     assert resolve_ticker(raw) == expected
+
+
+def test_default_universe_is_the_supported_tickers(agent):
+    assert agent.universe == config.SUPPORTED_TICKERS
+
+
+def test_universe_from_the_selection_stage_is_accepted(calls, tmp_path):
+    agent = DataCollectionAgent(cache=ResponseCache(tmp_path),
+                                universe=["OGDC", "LUCK"])
+
+    assert agent.collect("luck").ticker == "LUCK"
+    assert list(agent.collect_many()) == ["OGDC", "LUCK"]
+    with pytest.raises(UnsupportedTickerError):
+        agent.collect("MEBL")  # supported by default, but not in this universe

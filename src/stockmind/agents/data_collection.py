@@ -28,11 +28,18 @@ demand from the live sources:
 Use income_statement + balance_sheet together for ratios such as ROE:
 both are consolidated. PSX `financials` can be standalone figures.
 
-Scaling
--------
+Which companies
+---------------
+By default the agent accepts config.SUPPORTED_TICKERS. The Stock Selection
+stage (agents/stock_selection.py) chooses companies from the whole KMI-30
+instead and passes them in:
+
+    selection = StockSelectionAgent().select()
+    agent = DataCollectionAgent(universe=selection.universe)
+    data = agent.collect_many(selection.selected)
+
 Everything is fetched and cached per symbol, and peers are found from the
-PSX sector listing, so supporting more companies only means adding them to
-config.SUPPORTED_TICKERS. `collect_many()` collects several at once.
+PSX sector listing, so nothing assumes a fixed number of companies.
 
 How it stays fast
 -----------------
@@ -143,27 +150,42 @@ class DataCollectionAgent:
 
     name = "Data Collection Agent"
 
-    def __init__(self, cache: ResponseCache | None = None) -> None:
+    def __init__(
+        self,
+        cache: ResponseCache | None = None,
+        universe: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        """
+        Args:
+            cache: Response cache to use (default: config.CACHE_DIR).
+            universe: The tickers this agent accepts. Defaults to
+                config.SUPPORTED_TICKERS; the Stock Selection stage passes
+                the whole index here.
+        """
         self._cache = cache or ResponseCache(config.CACHE_DIR)
+        self.universe: tuple[str, ...] = (
+            tuple(universe) if universe else config.SUPPORTED_TICKERS
+        )
 
     def collect(self, ticker: str, force_refresh: bool = False) -> CompanyData:
         """
         Return all data for one ticker.
 
         Args:
-            ticker: A supported PSX symbol, e.g. "OGDC" (case-insensitive).
+            ticker: A PSX symbol in the agent's universe, e.g. "OGDC"
+                (case-insensitive).
             force_refresh: Ignore cached responses and fetch everything live.
 
         Raises:
-            UnsupportedTickerError: The ticker is not in config.SUPPORTED_TICKERS.
+            UnsupportedTickerError: The ticker is not in the agent's universe.
             DataUnavailableError: Price data could not be fetched.
         """
-        ticker = resolve_ticker(ticker)
+        ticker = resolve_ticker(ticker, self.universe)
 
         # The company's own sources and its sector peers are fetched together.
         with ThreadPoolExecutor(max_workers=len(SOURCES) + 1) as pool:
             futures = {
-                name: pool.submit(self._load, ticker, name, force_refresh)
+                name: pool.submit(self.load_source, ticker, name, force_refresh)
                 for name in SOURCES
             }
             peers_future = pool.submit(self._collect_peers, ticker, force_refresh)
@@ -206,13 +228,14 @@ class DataCollectionAgent:
 
     def collect_many(
         self,
-        tickers: list[str] | tuple[str, ...] = config.SUPPORTED_TICKERS,
+        tickers: list[str] | tuple[str, ...] | None = None,
         force_refresh: bool = False,
     ) -> dict[str, CompanyData]:
-        """Collect several tickers, e.g. for dashboards or evaluation runs."""
+        """Collect several tickers (default: the whole universe)."""
         return {
             data.ticker: data
-            for data in (self.collect(t, force_refresh) for t in tickers)
+            for data in (self.collect(t, force_refresh)
+                         for t in (tickers or self.universe))
         }
 
     # ------------------------------------------------------------------
@@ -221,7 +244,7 @@ class DataCollectionAgent:
         self, ticker: str, force_refresh: bool
     ) -> tuple[SectorPeers, list[str]]:
         """Find the sector's largest other companies and fetch their statements."""
-        listing = self._load(
+        listing = self.load_source(
             MARKET, "market_listing", force_refresh,
             fetch=lambda _: market.fetch_market_listing(),
             fallback=pd.DataFrame(),
@@ -241,7 +264,7 @@ class DataCollectionAgent:
         jobs = [(peer, source) for peer in symbols for source in PEER_SOURCES]
         with ThreadPoolExecutor(max_workers=config.MAX_PARALLEL_REQUESTS) as pool:
             loaded = list(pool.map(
-                lambda job: self._load(job[0], job[1], force_refresh), jobs
+                lambda job: self.load_source(job[0], job[1], force_refresh), jobs
             ))
 
         statements = {source: [] for source in PEER_SOURCES}
@@ -263,7 +286,7 @@ class DataCollectionAgent:
             balance_sheet=combine(statements["balance_sheet"]),
         ), warnings
 
-    def _load(
+    def load_source(
         self,
         owner: str,
         source: str,
@@ -275,6 +298,8 @@ class DataCollectionAgent:
         Load one source for one owner (a ticker, or MARKET) through the cache.
 
         Never raises for source errors: returns the fallback with a warning.
+        Returns {"value", "fetched_at", "warning"}. Also used by the Stock
+        Selection stage, so both share the same cache entries.
         """
         if fetch is None:
             fetch, fallback = SOURCES[source]

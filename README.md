@@ -2,21 +2,61 @@
 
 StockMind is a PSX-focused stock analysis and decision-support system developed as a Final Year Project.
 
-## Supported Companies
+## Which Companies Are Analysed
 
-StockMind is specialised for the five largest KMI-30 constituents by index weight (checked 2026-10-30):
+StockMind analyses companies from the **KMI-30** index. A selection stage (Stage 0) runs before Agent 1: it reads the current KMI-30 constituents live from PSX, groups them into categories, and selects the most promising companies in each category using the criteria described below. Agent 1 then collects data for the selected companies. Because the index is read live, PSX's rebalancing needs no code changes.
 
-| Ticker | Company | PSX sector |
-|---|---|---|
-| FFC | Fauji Fertilizer Company Limited | Fertilizer |
-| ENGROH | Engro Holdings Limited | Inv. Banks / Inv. Cos. / Securities Cos. |
-| MEBL | Meezan Bank Limited | Commercial Banks |
-| OGDC | Oil & Gas Development Company Limited | Oil & Gas Exploration Companies |
-| HUBC | The Hub Power Company Limited | Power Generation & Distribution |
-
-The list lives in `src/stockmind/config.py`. Run `python scripts/kmi30_weights.py` to check the current ranking after PSX rebalances the index.
+Without the selection stage, Agent 1 defaults to the five largest KMI-30 constituents by index weight (`SUPPORTED_TICKERS` in `src/stockmind/config.py`, checked 2026-10-30): FFC, ENGROH, MEBL, OGDC, HUBC. Run `python scripts/kmi30_weights.py` to see the current index weights.
 
 ## Current Development Scope
+
+### Stage 0 - Stock Selection (implemented)
+
+`src/stockmind/agents/stock_selection.py` decides **which** companies the pipeline analyses. Whether to buy them is still decided by the analysis and decision agents, so selecting "the best of a weak category" is fine: they can still say HOLD or SELL.
+
+```text
+KMI-30 (live) -> categories -> eligibility -> rank within category -> top picks -> Agent 1 -> Agents 2, 3, ...
+```
+
+**Categories.** Each company's sector is read live from PSX and mapped to a broad, GICS-style category (Energy, Materials, Financials, ...) by `SECTOR_CATEGORIES` in `config.py`. The table covers all 37 PSX sectors, not individual companies, so a company that joins the index is classified automatically. A sector PSX adds in future becomes its own category, with a warning, until it is added to the table.
+
+**Eligibility.** A company is only ranked if it has a full year of prices with at least 200 trading days, has traded in the last 10 days (not suspended), and trades at least PKR 20 million a day on average over the last 3 months.
+
+**Ranking.** Within its category, each measure becomes a percentile rank (best company = 1), and the selection score is the weighted sum (0-100):
+
+| Measure | Definition | Weight |
+|---|---|---|
+| 12-month return | price change, adjusted for bonus issues | 0.25 |
+| Risk-adjusted return | 12-month return / annualised volatility | 0.20 |
+| Maximum drawdown | worst fall from a previous peak (smaller is better) | 0.10 |
+| Earnings yield | 1 / P/E (no P/E ranks last) | 0.20 |
+| Dividend yield | PSX trailing dividend yield | 0.10 |
+| Liquidity | average daily traded value | 0.15 |
+
+Ranks are used instead of raw values so that measures in different units can be combined, one extreme value cannot dominate, and companies are only compared with their own category (a bank's low P/E is compared with other banks). Only market data is used: profitability and balance-sheet strength are Agent 3's job, so the selection does not pre-judge it.
+
+**Picks.** One company per category, plus one more for every further 5 eligible companies (`CATEGORY_SIZE_PER_PICK`), so Energy (9 companies) gets 2. Every selection comes with a reason, for example: *"FCCL ranks 1 of 6 eligible companies in Materials (selection score 78/100). 12-month return +12.9%, ..."*.
+
+**Speed.** One price history and one payouts request per constituent, shared with Agent 1's cache: about 30 s cold, under a second afterwards, and Agent 1 then reuses the cached prices.
+
+```python
+from stockmind.agents.data_collection import DataCollectionAgent
+from stockmind.agents.stock_selection import StockSelectionAgent
+
+selection = StockSelectionAgent().select()
+selection.selected      # e.g. ["GHNI", "TREET", "PRL", "ATRL", "MEBL", ...]
+selection.by_category   # {"Energy": ["PRL", "ATRL"], ...}
+selection.reasons       # ticker -> plain-English reason
+selection.ranking       # every constituent: measures, ranks, score, exclusions
+selection.warnings      # e.g. unknown sectors, categories with no eligible company
+
+agent = DataCollectionAgent(universe=selection.universe)
+data = agent.collect_many(selection.selected)
+```
+
+Files: `agents/stock_selection.py`, `data/universe.py` (index constituents and categories), `analysis/price_adjustments.py` (bonus adjustment, shared with Agent 2), `scripts/select_stocks.py`.
+
+Limitations: past performance does not predict future performance, so this is a screen, not a forecast. A very low P/E can come from one-off profits (e.g. refiners) and still ranks well on earnings yield. Some companies outside the original five have gaps on stockanalysis.com (e.g. PAEL has no dividend page); Agent 1 reports these as warnings.
 
 ### Agent 1 - Data Collection Agent (implemented, news pending)
 
@@ -126,6 +166,9 @@ If `python` opens the Microsoft Store on Windows, use `py` instead (e.g. `py -m 
 ### 5. Run the Agent and Tests
 
 ```powershell
+python scripts/select_stocks.py           # Stage 0: select from the KMI-30
+python scripts/select_stocks.py --collect # ...then run Agent 1 on the picks
+
 python scripts/collect_data.py          # all supported companies
 python scripts/collect_data.py OGDC     # one company
 python scripts/collect_data.py --force  # ignore the cache, fetch live
