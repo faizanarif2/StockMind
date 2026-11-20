@@ -68,3 +68,21 @@ def test_unexpected_errors_are_not_hidden(cache):
 
     with pytest.raises(KeyError):
         cache.get_or_fetch("k", timedelta(hours=1), buggy, (ConnectionError,))
+
+
+def test_extra_freshness_rule_can_force_a_refresh(cache):
+    source = Source()
+    cache.get_or_fetch("k", timedelta(hours=1), source, (ConnectionError,))
+    result = cache.get_or_fetch("k", timedelta(hours=1), source, (ConnectionError,),
+                                is_fresh=lambda fetched_at: False)
+
+    assert result.value == "value-2"
+
+
+def test_max_age_still_applies_with_a_freshness_rule(cache):
+    source = Source()
+    cache.get_or_fetch("k", timedelta(0), source, (ConnectionError,))
+    cache.get_or_fetch("k", timedelta(0), source, (ConnectionError,),
+                       is_fresh=lambda fetched_at: True)
+
+    assert source.calls == 2

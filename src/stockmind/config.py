@@ -5,7 +5,7 @@ and change without touching the agent code.
 """
 
 import os
-from datetime import timedelta
+from datetime import time, timedelta
 from pathlib import Path
 
 
@@ -129,6 +129,80 @@ CATEGORY_SIZE_PER_PICK = 5
 
 
 # ---------------------------------------------------------------------------
+# Market hours (market-aware refreshing)
+# ---------------------------------------------------------------------------
+# All market times are Pakistan time, whatever the computer's own time zone.
+MARKET_TIMEZONE = "Asia/Karachi"
+
+# Per weekday (Monday = 0): a broad window in which PSX's regular market MAY
+# be trading. It is deliberately wider than the official hours (about
+# 09:15-15:30; Friday 09:15-12:00 and 14:30-16:30; post-close until about
+# 16:50) so that pre-open, post-close and Ramadan timings all fit inside it.
+#   - Outside the window nothing market-driven is fetched (nights, weekends).
+#   - Inside it, PSX's own live market "State" decides whether trading is
+#     happening, so holidays (including moon-sighted ones) and unscheduled
+#     closures need no calendar.
+#   - A session's data is final once its window has ended.
+TRADING_WINDOWS: dict[int, tuple[time, time]] = {
+    0: (time(9, 0), time(16, 15)),
+    1: (time(9, 0), time(16, 15)),
+    2: (time(9, 0), time(16, 15)),
+    3: (time(9, 0), time(16, 15)),
+    4: (time(9, 0), time(17, 15)),
+}
+
+# How often data that changes during a session is refreshed while trading.
+SESSION_REFRESH = timedelta(minutes=15)
+
+# Sources whose data changes during a trading session. They are refreshed
+# by the market clock; CACHE_MAX_AGE is only an upper limit for them.
+MARKET_AWARE_SOURCES = ("prices", "company_page", "market_listing")
+
+# PSX's live market state (homepage "State" of this board) is re-read at
+# most this often. State words that mean "not trading"; any other word is
+# treated as trading, so unknown states never cause stale data.
+MARKET_STATE_MAX_AGE = timedelta(minutes=5)
+MARKET_STATE_BOARD = "REG"
+MARKET_CLOSED_STATES = ("CLOSED", "SUSPENDED", "HALTED", "HALT")
+
+# Market Watch (today's open/high/low/current/volume for every company in
+# one request) updates today's price bar between full downloads.
+# Kept OFF until its behaviour during a live session has been verified with
+# `python scripts/check_market_session.py`. While off, prices are refreshed
+# by downloading the full history every SESSION_REFRESH during a session.
+LIVE_PRICES_ENABLED = False
+# A Market Watch read is rejected (and the full download used instead) when
+# PSX's "As of" time lags the clock by more than this during trading, or
+# when Market Watch's total volume differs from PSX's regular-market volume
+# by more than this share.
+LIVE_PRICES_MAX_LAG = timedelta(minutes=20)
+LIVE_PRICES_VOLUME_TOLERANCE = 0.02
+
+
+# ---------------------------------------------------------------------------
+# Permanent history store
+# ---------------------------------------------------------------------------
+# Unlike the cache, this folder keeps every record ever collected, including
+# records that have since dropped out of a source's window (PSX shows 10
+# years of prices and 2 years of payouts). It CANNOT be rebuilt by
+# downloading again, so back it up (see README / scripts/backup_history.py).
+# Set the STOCKMIND_DATA_DIR environment variable to use another folder.
+HISTORY_DIR = Path(
+    os.environ.get("STOCKMIND_DATA_DIR", Path.home() / ".stockmind" / "data")
+)
+
+# Previous versions of each file kept in _backups/ before it is rewritten.
+HISTORY_BACKUPS_KEPT = 3
+
+# An update that would change more than this share of the stored records it
+# overlaps (and at least HISTORY_MIN_SUSPICIOUS_CHANGES of them) is refused
+# as suspicious, e.g. a unit change or a broken page. The stored data is
+# kept and a warning explains why.
+HISTORY_MAX_CORRECTION_SHARE = 0.05
+HISTORY_MIN_SUSPICIOUS_CHANGES = 5
+
+
+# ---------------------------------------------------------------------------
 # Sector peers
 # ---------------------------------------------------------------------------
 # For industry comparisons, Agent 1 also fetches the financial statements of
@@ -149,12 +223,14 @@ CACHE_DIR = Path(
 )
 
 # How long a cached response is reused before it is fetched again.
-# - Prices and the market snapshot change during the trading day.
+# - Prices and the market snapshot change during the trading day. They are
+#   refreshed by the market clock (see MARKET_AWARE_SOURCES); the values
+#   here are only an upper limit in case the clock is ever wrong.
 # - Dividends are announced occasionally.
 # - Balance sheets only change when a new annual report is published.
 CACHE_MAX_AGE: dict[str, timedelta] = {
-    "prices": timedelta(hours=1),
-    "company_page": timedelta(hours=1),
+    "prices": timedelta(days=1),
+    "company_page": timedelta(days=1),
     "payouts": timedelta(days=1),
     "index_constituents": timedelta(days=1),
     "dividend_history": timedelta(days=1),
