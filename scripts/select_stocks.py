@@ -1,10 +1,11 @@
-"""Run the Stock Selection stage (and optionally Agent 1) from the command line.
+"""Show the Stock Selection stage's ranking from the command line.
 
 Usage:
     python scripts/select_stocks.py            # rank the KMI-30, show the picks
     python scripts/select_stocks.py --all      # also show excluded companies
-    python scripts/select_stocks.py --collect  # then run Agent 1 on the picks
     python scripts/select_stocks.py --force    # ignore the cache, fetch live
+
+scripts/collect_data.py runs Agent 1 on this same selection.
 """
 
 import argparse
@@ -17,7 +18,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from stockmind.agents.data_collection import DataCollectionAgent
+from stockmind.agents.data_collection import DataUnavailableError
 from stockmind.agents.stock_selection import StockSelectionAgent
 
 
@@ -29,14 +30,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--all", action="store_true",
                         help="list every constituent, including excluded ones")
-    parser.add_argument("--collect", action="store_true",
-                        help="run the Data Collection Agent on the selection")
     parser.add_argument("--force", action="store_true",
                         help="ignore cached responses and fetch live")
     args = parser.parse_args()
 
     started = time.perf_counter()
-    selection = StockSelectionAgent().select(force_refresh=args.force)
+    selection = StockSelectionAgent().current(force_refresh=args.force)
     print(f"{selection.summary}  ({time.perf_counter() - started:.1f}s)\n")
 
     header = (f"  {'':2}{'#':>2} {'symbol':<8}{'score':>6}{'12m ret':>9}"
@@ -70,17 +69,9 @@ def main() -> None:
     for warning in selection.warnings:
         print(f"WARNING: {warning}")
 
-    if args.collect:
-        agent = DataCollectionAgent(universe=selection.universe)
-        for ticker in selection.selected:
-            started = time.perf_counter()
-            data = agent.collect(ticker, force_refresh=args.force)
-            print(f"\nAgent 1 collected {data.ticker}: {len(data.prices)} price rows, "
-                  f"{data.peers.sector} peers {', '.join(data.peers.tickers) or 'none'} "
-                  f"({time.perf_counter() - started:.1f}s)")
-            for warning in data.warnings:
-                print(f"  WARNING: {warning}")
-
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except DataUnavailableError as exc:
+        raise SystemExit(f"Error: {exc}")

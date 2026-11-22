@@ -122,6 +122,10 @@ SELECTION_MAX_PRICE_AGE = timedelta(days=10)  # older = suspended / not trading
 SELECTION_LIQUIDITY_DAYS = 63           # about 3 months of trading days
 SELECTION_MIN_TRADED_VALUE_M = 20.0     # PKR millions per day, on average
 
+# A new selection is not saved if more companies than this could not get
+# fresh prices: the outage would distort the ranking, so the last one is kept.
+SELECTION_MAX_FAILED_PRICES = 3
+
 # One company is selected per category, plus one more for every further
 # CATEGORY_SIZE_PER_PICK eligible companies: a category of 1-5 gets 1,
 # 6-10 gets 2, and so on. Large categories are not under-represented.
@@ -233,6 +237,8 @@ CACHE_MAX_AGE: dict[str, timedelta] = {
     "company_page": timedelta(days=1),
     "payouts": timedelta(days=1),
     "index_constituents": timedelta(days=1),
+    # Stage 0's result: recalculated when a session ends (see current()).
+    "selection": timedelta(days=7),
     "dividend_history": timedelta(days=1),
     "income_statement": timedelta(days=7),
     "balance_sheet": timedelta(days=7),

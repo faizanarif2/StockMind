@@ -6,7 +6,9 @@ StockMind is a PSX-focused stock analysis and decision-support system developed 
 
 StockMind analyses companies from the **KMI-30** index. A selection stage (Stage 0) runs before Agent 1: it reads the current KMI-30 constituents live from PSX, groups them into categories, and selects the most promising companies in each category using the criteria described below. Agent 1 then collects data for the selected companies. Because the index is read live, PSX's rebalancing needs no code changes.
 
-Without the selection stage, Agent 1 defaults to the five largest KMI-30 constituents by index weight (`SUPPORTED_TICKERS` in `src/stockmind/config.py`, checked 2026-10-30): FFC, ENGROH, MEBL, OGDC, HUBC. Run `python scripts/kmi30_weights.py` to see the current index weights.
+**Stage 0 is the default way to run.** `python scripts/collect_data.py` collects the Stage 0 selection; `python scripts/collect_data.py OGDC PRL` collects named KMI-30 companies instead. The selection itself is kept in the response cache until the next trading session has ended, so agents run at different times analyse the same companies. If PSX is unavailable, the last selection is reused with a warning. If there is no previous selection, the script stops with a clear error; it never silently switches to a fixed list.
+
+`SUPPORTED_TICKERS` in `src/stockmind/config.py` (FFC, ENGROH, MEBL, OGDC, HUBC, the five largest by index weight on 2026-10-30) remains only as the default of `DataCollectionAgent` when it is used directly. Run `python scripts/kmi30_weights.py` to see the current index weights.
 
 ## Current Development Scope
 
@@ -43,7 +45,7 @@ Ranks are used instead of raw values so that measures in different units can be 
 from stockmind.agents.data_collection import DataCollectionAgent
 from stockmind.agents.stock_selection import StockSelectionAgent
 
-selection = StockSelectionAgent().select()
+selection = StockSelectionAgent().current()  # the session's selection
 selection.selected      # e.g. ["GHNI", "TREET", "PRL", "ATRL", "MEBL", ...]
 selection.by_category   # {"Energy": ["PRL", "ATRL"], ...}
 selection.reasons       # ticker -> plain-English reason
@@ -219,10 +221,9 @@ If `python` opens the Microsoft Store on Windows, use `py` instead (e.g. `py -m 
 
 ```powershell
 python scripts/select_stocks.py           # Stage 0: select from the KMI-30
-python scripts/select_stocks.py --collect # ...then run Agent 1 on the picks
 python scripts/backup_history.py backup   # back up the permanent history store
 
-python scripts/collect_data.py          # all supported companies
+python scripts/collect_data.py          # the Stage 0 selection
 python scripts/collect_data.py OGDC     # one company
 python scripts/collect_data.py --force  # ignore the cache, fetch live
 python -m pytest

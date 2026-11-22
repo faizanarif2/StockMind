@@ -4,10 +4,12 @@ Prices are synthetic and every source is replaced with a fake, so these
 tests run offline.
 """
 
+import logging
 from datetime import datetime, timedelta
 
 import pandas as pd
 import pytest
+from psxdata.exceptions import PSXConnectionError
 
 from stockmind import config
 from stockmind.agents import data_collection
@@ -275,3 +277,139 @@ def test_missing_index_raises(fake_sources, cache, monkeypatch):
 
     with pytest.raises(data_collection.DataUnavailableError):
         StockSelectionAgent(cache=cache).select(now=NOW)
+
+
+# ---------------------------------------------------------------------------
+# One selection per session: StockSelectionAgent.current()
+# ---------------------------------------------------------------------------
+
+class FakeClock:
+    """`selection_fresh`: no session has ended since the selection was made.
+    `data_fresh`: market data in the cache is still current."""
+
+    def __init__(self):
+        self.selection_fresh = True
+        self.data_fresh = True
+
+    def is_fresh(self, fetched_at, interval=config.SESSION_REFRESH):
+        return self.selection_fresh if interval is None else self.data_fresh
+
+    def day_is_final(self, day, moment=None):
+        return True
+
+    def in_window(self, moment=None):
+        return False
+
+
+@pytest.fixture
+def stage0(fake_sources, cache):
+    """A selection agent that counts how often the ranking is recalculated."""
+    agent = StockSelectionAgent(cache=cache, clock=FakeClock())
+    agent.calculations = 0
+    rank = agent.select
+
+    def counted(*args, **kwargs):
+        agent.calculations += 1
+        return rank(*args, **kwargs)
+    agent.select = counted
+    return agent
+
+
+def _psx_down(monkeypatch):
+    def offline(*args):
+        raise PSXConnectionError("PSX unreachable")
+    monkeypatch.setitem(data_collection.SOURCES, "prices", (offline, None))
+    monkeypatch.setitem(data_collection.SOURCES, "payouts", (offline, pd.DataFrame()))
+    monkeypatch.setattr(universe, "fetch_index_table", offline)
+    monkeypatch.setattr(market, "fetch_market_listing", offline)
+
+
+def test_selection_itself_is_kept_during_a_session(stage0):
+    first = stage0.current(now=NOW)
+    second = stage0.current(now=NOW)
+
+    assert second.selected == first.selected == ["OGDC", "NEWCO"]
+    assert stage0.calculations == 1
+
+
+def test_selection_is_recalculated_after_a_session_ends(stage0):
+    stage0.current(now=NOW)
+    stage0._clock.selection_fresh = False
+
+    stage0.current(now=NOW)
+
+    assert stage0.calculations == 2
+
+
+def test_force_recalculates_the_selection(stage0):
+    stage0.current(now=NOW)
+    stage0.current(force_refresh=True, now=NOW)
+
+    assert stage0.calculations == 2
+
+
+def test_last_selection_is_reused_while_psx_is_down(stage0, monkeypatch):
+    first = stage0.current(now=NOW)
+    stage0._clock.selection_fresh = stage0._clock.data_fresh = False
+    _psx_down(monkeypatch)
+
+    reused = stage0.current(now=NOW)
+
+    assert reused.selected == first.selected
+    assert "KMI30:selection: source unavailable" in reused.warnings[0]
+    assert stage0.calculations == 1  # stopped before the per-company requests
+
+
+def test_outage_cannot_overwrite_the_last_good_selection(stage0, monkeypatch):
+    first = stage0.current(now=NOW)
+    stage0._clock.selection_fresh = False
+    monkeypatch.setitem(config.CACHE_MAX_AGE, "prices", timedelta(0))
+
+    def offline(symbol):
+        raise PSXConnectionError("PSX unreachable")
+    monkeypatch.setitem(data_collection.SOURCES, "prices", (offline, None))
+
+    reused = stage0.current(now=NOW)
+
+    assert reused.selected == first.selected
+    assert "4 PSX data sources were unavailable" in reused.warnings[0]
+
+
+def test_one_failed_company_does_not_block_a_new_selection(stage0, monkeypatch):
+    stage0.current(now=NOW)
+    stage0._clock.selection_fresh = False
+    monkeypatch.setitem(config.CACHE_MAX_AGE, "prices", timedelta(0))
+    working = data_collection.SOURCES["prices"][0]
+
+    def one_down(symbol):
+        if symbol == "PPL":
+            raise PSXConnectionError("PSX unreachable")
+        return working(symbol)
+    monkeypatch.setitem(data_collection.SOURCES, "prices", (one_down, None))
+
+    selection = stage0.current(now=NOW)
+
+    assert stage0.calculations == 2
+    assert not any("KMI30:selection" in warning for warning in selection.warnings)
+
+
+def test_no_previous_selection_is_a_clear_error(stage0, monkeypatch):
+    _psx_down(monkeypatch)
+
+    with pytest.raises(data_collection.DataUnavailableError,
+                       match="no previous selection to reuse"):
+        stage0.current(now=NOW)
+
+
+def test_an_empty_selection_is_never_saved(stage0, monkeypatch):
+    for symbol in PRICES:
+        monkeypatch.setitem(PRICES, symbol, make_prices(days=100))
+    with pytest.raises(data_collection.DataUnavailableError,
+                       match="no company passed the eligibility checks"):
+        stage0.current(now=NOW)
+
+
+
+def test_routine_library_warnings_are_hidden():
+    assert not logging.getLogger("psxdata.utils").isEnabledFor(logging.WARNING)
+    assert logging.getLogger("psxdata.utils").isEnabledFor(logging.ERROR)

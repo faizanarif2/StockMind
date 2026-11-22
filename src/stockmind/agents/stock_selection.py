@@ -53,14 +53,22 @@ How companies are chosen
 6. Picks. The top ceil(eligible / config.CATEGORY_SIZE_PER_PICK) companies
    of each category are selected (1 for a category of 1-5, 2 for 6-10 ...).
 
+7. One selection per session. Scripts call `current()`, which keeps the
+   selection itself in the response cache until the next session has ended,
+   so agents run at different times analyse the same companies. If PSX is
+   unavailable the last selection is reused with a warning. If there is no
+   previous selection, it raises a clear error: it never silently falls
+   back to a fixed list of companies.
+
 Only market data is used (prices, P/E, dividend yield). Profitability and
 balance-sheet strength are left to Agent 3, so the selection does not
 pre-judge what the Fundamental Agent will conclude.
 """
 
 import math
+import re
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 import pandas as pd
@@ -68,12 +76,14 @@ import pandas as pd
 from stockmind import config
 from stockmind.agents.data_collection import (
     MARKET,
+    SOURCE_ERRORS,
     DataCollectionAgent,
     DataUnavailableError,
 )
 from stockmind.analysis.price_adjustments import adjust_for_bonus
 from stockmind.data import market, universe
 from stockmind.data.cache import ResponseCache
+from stockmind.data.market_clock import MarketClock
 
 
 TRADING_DAYS_PER_YEAR = 252
@@ -288,6 +298,23 @@ def selection_reason(row: pd.Series, eligible_in_category: int) -> str:
     return text
 
 
+# The wording Agent 1's loader uses when a source could not be reached.
+_SOURCE_DOWN = re.compile(
+    r":(prices|index_constituents|market_listing)(: source)? unavailable"
+)
+
+
+def selection_problem(selection: StockSelection) -> str | None:
+    """Why a new selection must not replace the last good one, or None."""
+    if not selection.selected:
+        return "no company passed the eligibility checks"
+    down = [w for w in selection.warnings if _SOURCE_DOWN.search(w)]
+    market_down = [w for w in down if ":prices" not in w]
+    if market_down or len(down) > config.SELECTION_MAX_FAILED_PRICES:
+        return f"{len(down)} PSX data sources were unavailable"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
@@ -301,12 +328,15 @@ class StockSelectionAgent:
         self,
         cache: ResponseCache | None = None,
         index: str = config.SELECTION_INDEX,
+        clock: MarketClock | None = None,
     ) -> None:
         self.index = index
+        self._cache = cache or ResponseCache(config.CACHE_DIR)
+        self._clock = clock or MarketClock()
         # Agent 1's loader gives the same caching and stale-if-error
         # behaviour, and the same cache entries: prices fetched here are
         # reused when Agent 1 collects the selected companies.
-        self._loader = DataCollectionAgent(cache=cache)
+        self._loader = DataCollectionAgent(cache=self._cache, clock=self._clock)
 
     def select(
         self, force_refresh: bool = False, now: datetime | None = None
@@ -356,6 +386,52 @@ class StockSelectionAgent:
 
         ranking = rank_within_categories(pd.DataFrame(rows))[RANKING_COLUMNS]
         return self._result(ranking, symbols, warnings)
+
+    def current(
+        self, force_refresh: bool = False, now: datetime | None = None
+    ) -> StockSelection:
+        """
+        The selection every script should use: the same one until the next
+        trading session has ended.
+
+        Raises:
+            DataUnavailableError: Stage 0 cannot run and there is no previous
+                selection to reuse.
+        """
+        def calculate() -> StockSelection:
+            # Stop here if PSX is down, before about 60 per-company requests.
+            _, warnings = self._constituents(force_refresh)
+            if any(_SOURCE_DOWN.search(warning) for warning in warnings):
+                raise DataUnavailableError(
+                    "the PSX index list or market listing is unavailable")
+            selection = self.select(force_refresh=force_refresh, now=now)
+            problem = selection_problem(selection)
+            if problem:
+                raise DataUnavailableError(problem)
+            return selection
+
+        errors = (DataUnavailableError, *SOURCE_ERRORS)
+        try:
+            result = self._cache.get_or_fetch(
+                key=f"{self.index}:selection",
+                max_age=config.CACHE_MAX_AGE["selection"],
+                fetch=calculate,
+                fallback_errors=errors,
+                force_refresh=force_refresh,
+                is_fresh=lambda fetched_at: self._clock.is_fresh(
+                    fetched_at, interval=None),
+            )
+        except errors as exc:
+            raise DataUnavailableError(
+                f"Stage 0 could not select companies ({exc}) and there is no "
+                "previous selection to reuse. Check the connection to PSX "
+                "and run again."
+            ) from exc
+
+        if result.warning:
+            return replace(result.value,
+                           warnings=[result.warning, *result.value.warnings])
+        return result.value
 
     # ------------------------------------------------------------------
 
