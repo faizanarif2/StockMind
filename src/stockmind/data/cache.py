@@ -12,7 +12,11 @@ How it behaves
       project, and is never edited by hand. Deleting it is always safe:
       the agent simply fetches again.
     - Every entry remembers when it was fetched. Entries older than their
-      max age are fetched again on the next request.
+      max age are fetched again on the next request. A caller can also pass
+      an extra freshness rule (`is_fresh`): the market clock uses this so
+      market data is refreshed by trading activity, not only by age.
+    - It keeps only the latest response. Records worth keeping long-term
+      are merged into the permanent history store (history_store.py).
     - If the source fails, a previously fetched (stale) value is returned
       with a warning instead of failing the whole request.
 
@@ -51,9 +55,13 @@ class ResponseCache:
         fetch: Callable[[], Any],
         fallback_errors: tuple[type[Exception], ...],
         force_refresh: bool = False,
+        is_fresh: Callable[[datetime], bool] | None = None,
     ) -> CachedResult:
         """
         Return a fresh cached value, or call `fetch` and cache its result.
+
+        A cached value is fresh when it is no older than `max_age` and, if
+        given, `is_fresh(fetched_at)` is true.
 
         Raises:
             The fetch error, if fetching fails and nothing is cached.
@@ -62,7 +70,8 @@ class ResponseCache:
 
         if cached and not force_refresh:
             fetched_at, value = cached
-            if datetime.now() - fetched_at <= max_age:
+            if (datetime.now() - fetched_at <= max_age
+                    and (is_fresh is None or is_fresh(fetched_at))):
                 return CachedResult(value, fetched_at)
 
         try:

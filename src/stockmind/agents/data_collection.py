@@ -28,11 +28,18 @@ demand from the live sources:
 Use income_statement + balance_sheet together for ratios such as ROE:
 both are consolidated. PSX `financials` can be standalone figures.
 
-Scaling
--------
+Which companies
+---------------
+By default the agent accepts config.SUPPORTED_TICKERS. The Stock Selection
+stage (agents/stock_selection.py) chooses companies from the whole KMI-30
+instead and passes them in:
+
+    selection = StockSelectionAgent().select()
+    agent = DataCollectionAgent(universe=selection.universe)
+    data = agent.collect_many(selection.selected)
+
 Everything is fetched and cached per symbol, and peers are found from the
-PSX sector listing, so supporting more companies only means adding them to
-config.SUPPORTED_TICKERS. `collect_many()` collects several at once.
+PSX sector listing, so nothing assumes a fixed number of companies.
 
 How it stays fast
 -----------------
@@ -42,10 +49,29 @@ How it stays fast
    user's home folder. Repeat requests within the cache's max age are
    answered in milliseconds; older entries are fetched again.
 3. If a source is down, the last fetched copy is used and a warning is
-   attached, so the rest of the pipeline can still run.
+   attached, so the rest of the pipeline can still run. If nothing is
+   cached either, the permanent history store is used.
+
+Market-aware refreshing and permanent history
+---------------------------------------------
+4. Prices, the company page and the market listing are refreshed by the
+   market clock (data/market_clock.py): every config.SESSION_REFRESH while
+   PSX is trading, once more when a session ends, and not at all at night,
+   at weekends or on holidays.
+5. Every download is merged into the permanent history store
+   (data/history_store.py), so records that drop out of a source's window
+   (PSX keeps 10 years of prices, 2 years of payouts) are kept. The values
+   handed to the other agents have exactly the same columns as before;
+   they simply reach further back over time.
+6. When PSX shows a reporting quarter we have not seen before, the
+   financial statements are fetched again at once instead of waiting for
+   their weekly refresh.
+7. With config.LIVE_PRICES_ENABLED, today's price bar comes from PSX Market
+   Watch (one request for every company) between full downloads.
 """
 
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -55,8 +81,10 @@ import requests
 from psxdata.exceptions import PSXDataError
 
 from stockmind import config
-from stockmind.data import company, market, stockanalysis
+from stockmind.data import company, live_prices, market, stockanalysis
 from stockmind.data.cache import ResponseCache
+from stockmind.data.history_store import HistoryStore
+from stockmind.data.market_clock import MarketClock
 from stockmind.data.cleaning import clean_historical_data
 from stockmind.data.fetcher import fetch_historical_prices
 from stockmind.data.tickers import resolve_ticker
@@ -143,32 +171,61 @@ class DataCollectionAgent:
 
     name = "Data Collection Agent"
 
-    def __init__(self, cache: ResponseCache | None = None) -> None:
+    def __init__(
+        self,
+        cache: ResponseCache | None = None,
+        universe: list[str] | tuple[str, ...] | None = None,
+        history: HistoryStore | None = None,
+        clock: MarketClock | None = None,
+    ) -> None:
+        """
+        Args:
+            cache: Response cache to use (default: config.CACHE_DIR).
+            universe: The tickers this agent accepts. Defaults to
+                config.SUPPORTED_TICKERS; the Stock Selection stage passes
+                the whole index here.
+            history: Permanent history store (default: config.HISTORY_DIR).
+            clock: Market clock deciding when market data is refreshed.
+        """
         self._cache = cache or ResponseCache(config.CACHE_DIR)
+        self.universe: tuple[str, ...] = (
+            tuple(universe) if universe else config.SUPPORTED_TICKERS
+        )
+        self._history = history or HistoryStore(config.HISTORY_DIR)
+        self._clock = clock or MarketClock()
+        self._live_lock = threading.Lock()
 
     def collect(self, ticker: str, force_refresh: bool = False) -> CompanyData:
         """
         Return all data for one ticker.
 
         Args:
-            ticker: A supported PSX symbol, e.g. "OGDC" (case-insensitive).
+            ticker: A PSX symbol in the agent's universe, e.g. "OGDC"
+                (case-insensitive).
             force_refresh: Ignore cached responses and fetch everything live.
 
         Raises:
-            UnsupportedTickerError: The ticker is not in config.SUPPORTED_TICKERS.
+            UnsupportedTickerError: The ticker is not in the agent's universe.
             DataUnavailableError: Price data could not be fetched.
         """
-        ticker = resolve_ticker(ticker)
+        ticker = resolve_ticker(ticker, self.universe)
 
         # The company's own sources and its sector peers are fetched together.
         with ThreadPoolExecutor(max_workers=len(SOURCES) + 1) as pool:
             futures = {
-                name: pool.submit(self._load, ticker, name, force_refresh)
+                name: pool.submit(self.load_source, ticker, name, force_refresh)
                 for name in SOURCES
             }
             peers_future = pool.submit(self._collect_peers, ticker, force_refresh)
             results = {name: future.result() for name, future in futures.items()}
             peers, peer_warnings = peers_future.result()
+
+        # A reporting quarter we have not seen before has appeared on PSX:
+        # fetch the statements now rather than at their weekly refresh.
+        new_periods = results["company_page"]["history"].get("new_periods", {})
+        if new_periods.get("financials") and not force_refresh:
+            for name in ("income_statement", "balance_sheet"):
+                results[name] = self.load_source(ticker, name, force_refresh=True)
 
         warnings = [r["warning"] for r in results.values() if r["warning"]]
         warnings += peer_warnings
@@ -182,6 +239,12 @@ class DataCollectionAgent:
             )
 
         prices = results["prices"]["value"]
+        latest = prices["prices"]["date"].max() if not prices["prices"].empty else None
+        if latest is not None and not self._clock.day_is_final(pd.Timestamp(latest).date()):
+            warnings.append(
+                f"{ticker}: the latest price ({pd.Timestamp(latest):%Y-%m-%d}) is "
+                "from a session still in progress; it will change until the close."
+            )
         page = results["company_page"]["value"]
         face_value = page["profile"].get("equity", {}).get("face_value")
         payouts = results["payouts"]["value"]
@@ -206,13 +269,14 @@ class DataCollectionAgent:
 
     def collect_many(
         self,
-        tickers: list[str] | tuple[str, ...] = config.SUPPORTED_TICKERS,
+        tickers: list[str] | tuple[str, ...] | None = None,
         force_refresh: bool = False,
     ) -> dict[str, CompanyData]:
-        """Collect several tickers, e.g. for dashboards or evaluation runs."""
+        """Collect several tickers (default: the whole universe)."""
         return {
             data.ticker: data
-            for data in (self.collect(t, force_refresh) for t in tickers)
+            for data in (self.collect(t, force_refresh)
+                         for t in (tickers or self.universe))
         }
 
     # ------------------------------------------------------------------
@@ -221,7 +285,7 @@ class DataCollectionAgent:
         self, ticker: str, force_refresh: bool
     ) -> tuple[SectorPeers, list[str]]:
         """Find the sector's largest other companies and fetch their statements."""
-        listing = self._load(
+        listing = self.load_source(
             MARKET, "market_listing", force_refresh,
             fetch=lambda _: market.fetch_market_listing(),
             fallback=pd.DataFrame(),
@@ -241,7 +305,7 @@ class DataCollectionAgent:
         jobs = [(peer, source) for peer in symbols for source in PEER_SOURCES]
         with ThreadPoolExecutor(max_workers=config.MAX_PARALLEL_REQUESTS) as pool:
             loaded = list(pool.map(
-                lambda job: self._load(job[0], job[1], force_refresh), jobs
+                lambda job: self.load_source(job[0], job[1], force_refresh), jobs
             ))
 
         statements = {source: [] for source in PEER_SOURCES}
@@ -263,7 +327,7 @@ class DataCollectionAgent:
             balance_sheet=combine(statements["balance_sheet"]),
         ), warnings
 
-    def _load(
+    def load_source(
         self,
         owner: str,
         source: str,
@@ -274,7 +338,15 @@ class DataCollectionAgent:
         """
         Load one source for one owner (a ticker, or MARKET) through the cache.
 
-        Never raises for source errors: returns the fallback with a warning.
+        Never raises for source errors: returns the fallback with a warning
+        (or, if the history store has the data, the stored history).
+        Returns {"value", "fetched_at", "warning", "history"}. Also used by
+        the Stock Selection stage, so both share the same cache entries.
+
+        Steps: the cache decides whether to download (market-aware for
+        config.MARKET_AWARE_SOURCES); the result is merged into the history
+        store, which returns the full retained history in the same shape;
+        with live prices enabled, today's bar comes from Market Watch.
         """
         if fetch is None:
             fetch, fallback = SOURCES[source]
@@ -285,13 +357,69 @@ class DataCollectionAgent:
                 fetch=lambda: fetch(owner),
                 fallback_errors=SOURCE_ERRORS,
                 force_refresh=force_refresh,
+                is_fresh=self._freshness_rule(source),
             )
         except SOURCE_ERRORS as exc:
             message = f"{owner}:{source} unavailable ({type(exc).__name__}: {exc})."
+            stored = self._history.stored_value(owner, source)
+            if stored is not None:
+                message += " Using the permanent history store instead."
             logger.warning(message)
-            return {"value": fallback, "fetched_at": None, "warning": message}
+            return {"value": stored if stored is not None else fallback,
+                    "fetched_at": None, "warning": message, "history": {}}
 
-        if result.warning:
-            logger.warning(result.warning)
-        return {"value": result.value, "fetched_at": result.fetched_at,
-                "warning": result.warning}
+        warnings = [result.warning] if result.warning else []
+        value, history = self._history.retain(
+            owner, source, result.value, self._clock.day_is_final)
+        warnings += history["warnings"]
+
+        if source == "prices" and config.LIVE_PRICES_ENABLED:
+            value, live_warning = self._with_live_bar(owner, value)
+            if live_warning:
+                warnings.append(live_warning)
+
+        message = " ".join(warnings) or None
+        if message:
+            logger.warning(message)
+        return {"value": value, "fetched_at": result.fetched_at,
+                "warning": message, "history": history}
+
+    def _freshness_rule(self, source: str):
+        """The market clock's rule for market-driven sources, else None."""
+        if source not in config.MARKET_AWARE_SOURCES:
+            return None
+        # With Market Watch supplying today's bar, the full price history is
+        # only needed once each session has ended.
+        interval = (None if source == "prices" and config.LIVE_PRICES_ENABLED
+                    else config.SESSION_REFRESH)
+        return lambda fetched_at: self._clock.is_fresh(fetched_at, interval)
+
+    def _with_live_bar(self, owner: str, value) -> tuple[object, str | None]:
+        """Put today's Market Watch bar on the price history, if it can be
+        trusted (see live_prices.LiveSnapshot.problem)."""
+        if value is None or not self._clock.in_window():
+            return value, None
+        with self._live_lock:  # one Market Watch read for all companies
+            try:
+                snapshot = self._cache.get_or_fetch(
+                    key=f"{MARKET}:market_watch",
+                    max_age=config.SESSION_REFRESH,
+                    fetch=live_prices.fetch_live_snapshot,
+                    fallback_errors=SOURCE_ERRORS,
+                ).value
+            except SOURCE_ERRORS as exc:
+                return value, (f"{owner}:prices: Market Watch unavailable "
+                               f"({type(exc).__name__}); using the last full download.")
+
+        problem = snapshot.problem(self._clock.now())
+        if problem:
+            return value, (f"{owner}:prices: Market Watch not used ({problem}); "
+                           "using the last full download.")
+        bar = snapshot.bar(owner)
+        prices = value["prices"]
+        if bar is None:
+            return value, None
+        if (not prices.empty and prices["date"].max() >= bar["date"]
+                and self._clock.day_is_final(bar["date"].date())):
+            return value, None  # the official final row is already there
+        return {**value, "prices": live_prices.overlay_bar(prices, bar)}, None

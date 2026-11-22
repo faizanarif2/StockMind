@@ -204,3 +204,124 @@ def test_unsupported_ticker_is_rejected_before_any_fetch(calls, agent):
 )
 def test_resolve_ticker(raw, expected):
     assert resolve_ticker(raw) == expected
+
+
+def test_default_universe_is_the_supported_tickers(agent):
+    assert agent.universe == config.SUPPORTED_TICKERS
+
+
+def test_universe_from_the_selection_stage_is_accepted(calls, tmp_path):
+    agent = DataCollectionAgent(cache=ResponseCache(tmp_path),
+                                universe=["OGDC", "LUCK"])
+
+    assert agent.collect("luck").ticker == "LUCK"
+    assert list(agent.collect_many()) == ["OGDC", "LUCK"]
+    with pytest.raises(UnsupportedTickerError):
+        agent.collect("MEBL")  # supported by default, but not in this universe
+
+
+# ---------------------------------------------------------------------------
+# Permanent history and market-aware refreshing
+# ---------------------------------------------------------------------------
+
+from datetime import datetime
+
+from stockmind.data import live_prices
+from stockmind.data.history_store import HistoryStore
+from stockmind.data.live_prices import LiveSnapshot
+from stockmind.data.market_clock import PKT, MarketClock, MarketState
+
+
+def _set_prices(monkeypatch, frame):
+    def fetch(ticker):
+        return {"prices": frame, "price_issues": frame.iloc[0:0]}
+    monkeypatch.setitem(data_collection.SOURCES, "prices", (fetch, None))
+
+
+def test_prices_that_leave_the_source_window_are_kept(calls, agent, monkeypatch):
+    agent.collect("OGDC")  # stores 2026-10-29 and 2026-10-30
+    monkeypatch.setitem(config.CACHE_MAX_AGE, "prices", timedelta(0))
+    later = PRICES.assign(date=pd.to_datetime(["2026-10-30", "2026-11-02"]))
+    _set_prices(monkeypatch, later)  # the source no longer shows 10-29
+
+    data = agent.collect("OGDC")
+
+    assert [f"{d:%m-%d}" for d in data.prices["date"]] == ["10-29", "10-30", "11-02"]
+    assert list(data.prices.columns) == list(PRICES.columns) + [
+        c for c in data.prices.columns if c not in PRICES.columns]
+
+
+def test_history_store_is_used_when_source_and_cache_are_empty(calls, tmp_path, monkeypatch):
+    DataCollectionAgent(cache=ResponseCache(tmp_path / "c1")).collect("OGDC")
+    _break_source(monkeypatch, "prices")
+
+    data = DataCollectionAgent(cache=ResponseCache(tmp_path / "c2")).collect("OGDC")
+
+    assert len(data.prices) == 2
+    assert any("permanent history store" in w for w in data.warnings)
+
+
+def test_new_psx_quarter_refreshes_the_statements_at_once(calls, agent, monkeypatch):
+    def page(periods):
+        financials = pd.DataFrame({"period_type": "quarterly", "period": periods,
+                                   "metric": "eps", "value": 1.0})
+        return {"profile": {"name": "Test Co", "equity": {"face_value": 10.0}},
+                "financials": financials, "ratios": pd.DataFrame()}
+
+    def serve(periods):
+        monkeypatch.setitem(data_collection.SOURCES, "company_page",
+                            (lambda ticker: page(periods),
+                             data_collection.SOURCES["company_page"][1]))
+
+    serve(["Q4 2026"])
+    agent.collect("OGDC")
+    agent.collect("OGDC")
+    assert calls["income_statement"] == 1  # nothing new, weekly cache used
+
+    monkeypatch.setitem(config.CACHE_MAX_AGE, "company_page", timedelta(0))
+    serve(["Q4 2026", "Q1 2027"])
+    agent.collect("OGDC")
+
+    assert calls["income_statement"] == 2 and calls["balance_sheet"] == 2
+
+
+def test_live_prices_are_off_by_default(calls, agent, monkeypatch):
+    def must_not_run():
+        raise AssertionError("Market Watch read while disabled")
+    monkeypatch.setattr(live_prices, "fetch_live_snapshot", must_not_run)
+
+    agent.collect("OGDC")
+
+
+MONDAY_11 = datetime(2026, 11, 23, 11, 0, tzinfo=PKT)
+
+
+def _live_agent(tmp_path, monkeypatch, volume):
+    monkeypatch.setattr(config, "LIVE_PRICES_ENABLED", True)
+    state = MarketState("Open", MONDAY_11, 5_000.0, 10.0, MONDAY_11)
+    snapshot = LiveSnapshot(
+        prices=pd.DataFrame({"symbol": ["OGDC"], "ldcp": [11.5], "open": [11.6],
+                             "high": [12.4], "low": [11.4], "close": [12.0],
+                             "volume": [volume]}),
+        state=state, fetched_at=MONDAY_11)
+    monkeypatch.setattr(live_prices, "fetch_live_snapshot", lambda: snapshot)
+    clock = MarketClock(fetch_state=lambda: state, now=lambda: MONDAY_11)
+    return DataCollectionAgent(cache=ResponseCache(tmp_path), clock=clock)
+
+
+def test_live_bar_is_added_during_a_session(calls, tmp_path, monkeypatch):
+    data = _live_agent(tmp_path, monkeypatch, volume=5_000).collect("OGDC")
+
+    last = data.prices.iloc[-1]
+    assert f"{last['date']:%Y-%m-%d}" == "2026-11-23" and last["close"] == 12.0
+    assert any("session still in progress" in w for w in data.warnings)
+    # The partial bar is never written to the permanent history.
+    stored, _ = HistoryStore(config.HISTORY_DIR).load("OGDC", "prices")
+    assert stored["date"].max() == pd.Timestamp("2026-10-30")
+
+
+def test_untrustworthy_live_bar_is_not_used(calls, tmp_path, monkeypatch):
+    data = _live_agent(tmp_path, monkeypatch, volume=9_999).collect("OGDC")
+
+    assert data.prices["date"].max() == pd.Timestamp("2026-10-30")
+    assert any("Market Watch not used" in w for w in data.warnings)

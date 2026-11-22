@@ -1,8 +1,8 @@
 """Run the Data Collection Agent from the command line.
 
 Usage:
-    python scripts/collect_data.py              # all supported tickers
-    python scripts/collect_data.py OGDC MEBL    # selected tickers
+    python scripts/collect_data.py              # the Stage 0 selection
+    python scripts/collect_data.py OGDC MEBL    # named KMI-30 companies
     python scripts/collect_data.py --force      # ignore the cache, fetch live
 """
 
@@ -16,8 +16,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from stockmind.agents.data_collection import DataCollectionAgent
-from stockmind.config import SUPPORTED_TICKERS
+from stockmind.agents.data_collection import DataCollectionAgent, DataUnavailableError
+from stockmind.agents.stock_selection import StockSelectionAgent
+from stockmind.data.tickers import UnsupportedTickerError
 
 
 def _span(df, column: str) -> str:
@@ -30,14 +31,20 @@ def _span(df, column: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("tickers", nargs="*", default=list(SUPPORTED_TICKERS))
+    parser.add_argument("tickers", nargs="*")
     parser.add_argument("--force", action="store_true",
                         help="ignore cached responses and fetch live")
     args = parser.parse_args()
 
-    agent = DataCollectionAgent()
+    selection = StockSelectionAgent().current(force_refresh=args.force)
+    tickers = args.tickers or selection.selected
+    agent = DataCollectionAgent(universe=selection.universe)
+    if not args.tickers:
+        print(selection.summary)
+        for warning in selection.warnings:
+            print(f"WARNING: {warning}")
 
-    for ticker in args.tickers:
+    for ticker in tickers:
         started = time.perf_counter()
         data = agent.collect(ticker, force_refresh=args.force)
         seconds = time.perf_counter() - started
@@ -64,4 +71,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (DataUnavailableError, UnsupportedTickerError) as exc:
+        raise SystemExit(f"Error: {exc}")
