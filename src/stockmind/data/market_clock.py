@@ -232,7 +232,7 @@ class MarketClock:
 
         `interval` is how often to refresh during a session; None means
         "not during a session, only once each session has ended" (used for
-        full price history when Market Watch supplies the live bar).
+        the Stage 0 selection, which should not change mid-session).
         """
         now = to_pkt(moment) if moment else self.now()
         fetched = to_pkt(fetched_at)

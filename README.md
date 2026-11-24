@@ -133,13 +133,11 @@ python scripts/backup_history.py restore <file.zip>      # restore a backup
 
 A restore never deletes anything: the current store is first renamed to `data.before-restore-<time>`. Set the `STOCKMIND_DATA_DIR` environment variable to keep the store somewhere else.
 
-**Live prices (Market Watch), switched off until verified.** PSX's historical endpoint always returns a company's full 10-year history, so each refresh during a session downloads it again. PSX's Market Watch page lists today's open, high, low, current price and volume for every company in one request. Market Watch has no timestamp of its own, so each read is checked against PSX's homepage. Its "As of" time must be recent while trading, and Market Watch's total volume must match PSX's regular-market volume (both were exactly 620,697,365 shares after the close on 2026-11-20). After the close, Market Watch matched the official daily history exactly for every company checked. Its behaviour *during* a session has not been verified yet, so `LIVE_PRICES_ENABLED` is `False` and prices are refreshed by full downloads. To verify, run this on a trading day, before the open, and leave it running:
+**Tested against a live session.** On 2026-11-23, PSX's data was sampled every minute for a full trading day (501 samples):
 
-```powershell
-python scripts/check_market_session.py
-```
-
-It samples every minute until 17:30 PKT and writes a log and a report to `~/.stockmind/session_checks/`. The report covers the State words PSX uses, how often "As of" and Market Watch update, the volume agreement during trading, whether the daily history contains a partial bar for today, and whether the final Market Watch values match the official daily row.
+- **The normal price download is live during a session.** From the open it includes today's unfinished prices, so a fall shows up within 15 minutes (`SESSION_REFRESH`). Agent 1 warns when the latest row is unfinished, and that row is only stored in the history once the session has ended.
+- **The market clock reads PSX correctly.** PSX's State moved Ready → Pre-Open → Open (09:35) → Post-Close → Closed (15:50). Prices kept changing until Closed, and the final prices matched the official daily history for every company checked.
+- **A faster alternative was tested and dropped.** PSX's Market Watch page lists every company's current prices in one request, but it was never more up to date than the normal download (it only updates every 5 minutes). It would also have needed extra safeguards: it still shows the previous day's prices before the open, and early in the session its total volume ran up to 2.8% ahead of PSX's own figure. It was therefore removed.
 
 **Scaling to more companies.** Nothing in the code assumes five companies. To support more, add their symbols to `SUPPORTED_TICKERS` in `config.py`. Peers are found automatically from the PSX sector listing, and every source is fetched and cached per symbol, so a company that is both supported and a peer is fetched only once. `DataCollectionAgent().collect_many()` collects all supported companies in one call.
 
@@ -266,7 +264,7 @@ Unusual values will not automatically be treated as errors because genuine marke
 
 ## Known Data Limitations
 
-- Live market timing (State words, Market Watch update frequency during a session) is not yet verified; see "Live prices" above.
+- During a trading session the latest price row is today's unfinished session. Agent 1 adds a warning, and the row is not stored in the history until the session has ended.
 - History depth is set by the sources: about 10 years of prices (PSX always returns its full window), 5 years of statements, and about 5-7 years of dividends.
 - PSX `financials` can be standalone figures (e.g. ENGROH), while stockanalysis.com statements are consolidated. Do not mix them in one ratio.
 - ENGROH has no payout announcements on PSX since it was renamed from Dawood Hercules (DAWH). `dividend_history` still shows DAWH-era dividends (2019-2024), because it is the same listed company.

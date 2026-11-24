@@ -226,9 +226,7 @@ def test_universe_from_the_selection_stage_is_accepted(calls, tmp_path):
 
 from datetime import datetime
 
-from stockmind.data import live_prices
 from stockmind.data.history_store import HistoryStore
-from stockmind.data.live_prices import LiveSnapshot
 from stockmind.data.market_clock import PKT, MarketClock, MarketState
 
 
@@ -285,43 +283,22 @@ def test_new_psx_quarter_refreshes_the_statements_at_once(calls, agent, monkeypa
     assert calls["income_statement"] == 2 and calls["balance_sheet"] == 2
 
 
-def test_live_prices_are_off_by_default(calls, agent, monkeypatch):
-    def must_not_run():
-        raise AssertionError("Market Watch read while disabled")
-    monkeypatch.setattr(live_prices, "fetch_live_snapshot", must_not_run)
-
-    agent.collect("OGDC")
-
-
 MONDAY_11 = datetime(2026, 11, 23, 11, 0, tzinfo=PKT)
 
 
-def _live_agent(tmp_path, monkeypatch, volume):
-    monkeypatch.setattr(config, "LIVE_PRICES_ENABLED", True)
+def test_an_unfinished_session_is_flagged_and_never_stored(calls, tmp_path, monkeypatch):
+    # During a session PSX's daily history already includes today's
+    # unfinished row (seen in the session check on 2026-11-23).
+    today = pd.DataFrame({"date": [pd.Timestamp("2026-11-23")], "open": [11.6],
+                          "high": [12.4], "low": [11.4], "close": [12.0],
+                          "volume": [5000]})
+    _set_prices(monkeypatch, pd.concat([PRICES, today], ignore_index=True))
     state = MarketState("Open", MONDAY_11, 5_000.0, 10.0, MONDAY_11)
-    snapshot = LiveSnapshot(
-        prices=pd.DataFrame({"symbol": ["OGDC"], "ldcp": [11.5], "open": [11.6],
-                             "high": [12.4], "low": [11.4], "close": [12.0],
-                             "volume": [volume]}),
-        state=state, fetched_at=MONDAY_11)
-    monkeypatch.setattr(live_prices, "fetch_live_snapshot", lambda: snapshot)
     clock = MarketClock(fetch_state=lambda: state, now=lambda: MONDAY_11)
-    return DataCollectionAgent(cache=ResponseCache(tmp_path), clock=clock)
 
+    data = DataCollectionAgent(cache=ResponseCache(tmp_path), clock=clock).collect("OGDC")
 
-def test_live_bar_is_added_during_a_session(calls, tmp_path, monkeypatch):
-    data = _live_agent(tmp_path, monkeypatch, volume=5_000).collect("OGDC")
-
-    last = data.prices.iloc[-1]
-    assert f"{last['date']:%Y-%m-%d}" == "2026-11-23" and last["close"] == 12.0
+    assert data.prices["date"].max() == pd.Timestamp("2026-11-23")
     assert any("session still in progress" in w for w in data.warnings)
-    # The partial bar is never written to the permanent history.
     stored, _ = HistoryStore(config.HISTORY_DIR).load("OGDC", "prices")
     assert stored["date"].max() == pd.Timestamp("2026-10-30")
-
-
-def test_untrustworthy_live_bar_is_not_used(calls, tmp_path, monkeypatch):
-    data = _live_agent(tmp_path, monkeypatch, volume=9_999).collect("OGDC")
-
-    assert data.prices["date"].max() == pd.Timestamp("2026-10-30")
-    assert any("Market Watch not used" in w for w in data.warnings)

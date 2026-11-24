@@ -169,19 +169,6 @@ MARKET_STATE_MAX_AGE = timedelta(minutes=5)
 MARKET_STATE_BOARD = "REG"
 MARKET_CLOSED_STATES = ("CLOSED", "SUSPENDED", "HALTED", "HALT")
 
-# Market Watch (today's open/high/low/current/volume for every company in
-# one request) updates today's price bar between full downloads.
-# Kept OFF until its behaviour during a live session has been verified with
-# `python scripts/check_market_session.py`. While off, prices are refreshed
-# by downloading the full history every SESSION_REFRESH during a session.
-LIVE_PRICES_ENABLED = False
-# A Market Watch read is rejected (and the full download used instead) when
-# PSX's "As of" time lags the clock by more than this during trading, or
-# when Market Watch's total volume differs from PSX's regular-market volume
-# by more than this share.
-LIVE_PRICES_MAX_LAG = timedelta(minutes=20)
-LIVE_PRICES_VOLUME_TOLERANCE = 0.02
-
 
 # ---------------------------------------------------------------------------
 # Permanent history store

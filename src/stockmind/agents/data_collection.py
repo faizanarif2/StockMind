@@ -66,12 +66,9 @@ Market-aware refreshing and permanent history
 6. When PSX shows a reporting quarter we have not seen before, the
    financial statements are fetched again at once instead of waiting for
    their weekly refresh.
-7. With config.LIVE_PRICES_ENABLED, today's price bar comes from PSX Market
-   Watch (one request for every company) between full downloads.
 """
 
 import logging
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -81,7 +78,7 @@ import requests
 from psxdata.exceptions import PSXDataError
 
 from stockmind import config
-from stockmind.data import company, live_prices, market, stockanalysis
+from stockmind.data import company, market, stockanalysis
 from stockmind.data.cache import ResponseCache
 from stockmind.data.history_store import HistoryStore
 from stockmind.data.market_clock import MarketClock
@@ -193,7 +190,6 @@ class DataCollectionAgent:
         )
         self._history = history or HistoryStore(config.HISTORY_DIR)
         self._clock = clock or MarketClock()
-        self._live_lock = threading.Lock()
 
     def collect(self, ticker: str, force_refresh: bool = False) -> CompanyData:
         """
@@ -345,8 +341,7 @@ class DataCollectionAgent:
 
         Steps: the cache decides whether to download (market-aware for
         config.MARKET_AWARE_SOURCES); the result is merged into the history
-        store, which returns the full retained history in the same shape;
-        with live prices enabled, today's bar comes from Market Watch.
+        store, which returns the full retained history in the same shape.
         """
         if fetch is None:
             fetch, fallback = SOURCES[source]
@@ -373,11 +368,6 @@ class DataCollectionAgent:
             owner, source, result.value, self._clock.day_is_final)
         warnings += history["warnings"]
 
-        if source == "prices" and config.LIVE_PRICES_ENABLED:
-            value, live_warning = self._with_live_bar(owner, value)
-            if live_warning:
-                warnings.append(live_warning)
-
         message = " ".join(warnings) or None
         if message:
             logger.warning(message)
@@ -388,38 +378,4 @@ class DataCollectionAgent:
         """The market clock's rule for market-driven sources, else None."""
         if source not in config.MARKET_AWARE_SOURCES:
             return None
-        # With Market Watch supplying today's bar, the full price history is
-        # only needed once each session has ended.
-        interval = (None if source == "prices" and config.LIVE_PRICES_ENABLED
-                    else config.SESSION_REFRESH)
-        return lambda fetched_at: self._clock.is_fresh(fetched_at, interval)
-
-    def _with_live_bar(self, owner: str, value) -> tuple[object, str | None]:
-        """Put today's Market Watch bar on the price history, if it can be
-        trusted (see live_prices.LiveSnapshot.problem)."""
-        if value is None or not self._clock.in_window():
-            return value, None
-        with self._live_lock:  # one Market Watch read for all companies
-            try:
-                snapshot = self._cache.get_or_fetch(
-                    key=f"{MARKET}:market_watch",
-                    max_age=config.SESSION_REFRESH,
-                    fetch=live_prices.fetch_live_snapshot,
-                    fallback_errors=SOURCE_ERRORS,
-                ).value
-            except SOURCE_ERRORS as exc:
-                return value, (f"{owner}:prices: Market Watch unavailable "
-                               f"({type(exc).__name__}); using the last full download.")
-
-        problem = snapshot.problem(self._clock.now())
-        if problem:
-            return value, (f"{owner}:prices: Market Watch not used ({problem}); "
-                           "using the last full download.")
-        bar = snapshot.bar(owner)
-        prices = value["prices"]
-        if bar is None:
-            return value, None
-        if (not prices.empty and prices["date"].max() >= bar["date"]
-                and self._clock.day_is_final(bar["date"].date())):
-            return value, None  # the official final row is already there
-        return {**value, "prices": live_prices.overlay_bar(prices, bar)}, None
+        return lambda fetched_at: self._clock.is_fresh(fetched_at)
