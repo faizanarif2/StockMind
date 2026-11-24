@@ -60,7 +60,7 @@ Files: `agents/stock_selection.py`, `data/universe.py` (index constituents and c
 
 Limitations: past performance does not predict future performance, so this is a screen, not a forecast. A very low P/E can come from one-off profits (e.g. refiners) and still ranks well on earnings yield. Some companies outside the original five have gaps on stockanalysis.com (e.g. PAEL has no dividend page); Agent 1 reports these as warnings.
 
-### Agent 1 - Data Collection Agent (implemented, news pending)
+### Agent 1 - Data Collection Agent (implemented)
 
 `src/stockmind/agents/data_collection.py` fetches everything later agents need for one company, live from the sources:
 
@@ -76,12 +76,47 @@ Limitations: past performance does not predict future performance, so this is a 
 | `balance_sheet` | Consolidated assets, liabilities, shareholders' equity, debt, book value per share | 5 years | stockanalysis.com |
 | `dividend_history` | Cash dividend per share with ex, record and pay dates | ~5-7 years | stockanalysis.com |
 | `peers` | Sector name, the largest other companies in the same PSX sector, their market cap / price / P/E / dividend yield, and their income statements and balance sheets | 5 years | PSX listing + stockanalysis.com |
+| `news` | For the Sentiment Agent: the company's official announcements and business-news headlines about the company, its sector or the market, tagged for relevance (see below) | 5 years of announcements; headlines from the first run on | PSX announcements + Business Recorder, Dawn, Express Tribune, ProPakistani |
 
 Amounts are in PKR thousands, per-share values in PKR. For ratios such as ROE, use `income_statement` and `balance_sheet` together: both are consolidated, so they are consistent with each other.
 
 **Sector peers (industry averages).** To judge whether a ratio is good, the Fundamental Agent compares it with the company's industry. Agent 1 finds the `PEERS_PER_COMPANY` (default 4) largest other companies in the same PSX sector by market cap, for example MEBL → UBL, MCB, HBL, NBP. Peer statements use the same layout as the company's own, with an extra `ticker` column.
 
-News collection for the Sentiment Agent will be added later.
+**News for the Sentiment Agent (Agent 4).** `CompanyData.news` is one table, newest first, built by `src/stockmind/data/news.py` from two kinds of source:
+
+| Source | What it gives | History | Refreshed |
+|---|---|---|---|
+| PSX company announcements (`dps.psx.com.pk/announcements`) | Official disclosures the company files itself, e.g. results, dividends, "Gas/condensate discovery at Bitrisim Northwest-1", buy-backs, board changes. Timestamped to the minute, published the same day. | 5 years (`NEWS_HISTORY_YEARS`), loaded the first time a company is collected | hourly |
+| Business-news RSS feeds (`NEWS_FEEDS`): Business Recorder, Dawn, Express Tribune, ProPakistani | What the press reports. One download serves every company. | Feeds show only their latest ~30 headlines, so headlines are kept from the first run onwards | every 2 hours |
+
+Every source allows automated access in its robots.txt and needs no API key. Sources tested and rejected: Google News search feeds (robots.txt forbids automated access), the GDELT news API (12-17 s per request, rate-limited, almost no PSX coverage), and the text inside announcement PDFs (mostly scanned images with no text, up to 90 s to download).
+
+Columns (`news.NEWS_COLUMNS`):
+
+| Column | Meaning |
+|---|---|
+| `article_id` | Stable id (`psx-<PSX document number>` or `rss-<hash of the link>`), so nothing is stored or analysed twice |
+| `published_at` | Pakistan time, like every other date in StockMind |
+| `kind` | `announcement` (PSX) or `article` (press) |
+| `relevance` | `company` (names the company: every announcement, and headlines using one of its names or its ticker), `sector` (an industry term from `NEWS_SECTOR_KEYWORDS`, e.g. urea for fertilizer makers), `market` (the PSX as a whole, e.g. KSE-100 reports) |
+| `category` | Announcements only: `operations`, `dividend`, `governance`, `financial_results`, `board_meeting`, ... |
+| `informative` | `False` when the headline itself carries no news: board-meeting notices, report transmissions, dividend payment notices, a bare "Material Information". Over 50% of PSX announcements are of this kind |
+| `title`, `summary`, `source`, `url` | The headline, the publisher's summary (at most 400 characters, press only), the source name, and a link to the article or PSX document |
+
+**Why only headlines and short summaries?** Agent 1 does not store or analyse full articles. Headlines are what FinBERT was built and benchmarked for (Financial PhraseBank is made of single sentences), they keep the data small, and storing whole articles would copy copyrighted text. Sentiment scoring belongs to Agent 4: FinBERT is a large model and would slow down every agent that needs Agent 1. Agent 4 should score each `article_id` once and cache the score.
+
+**Companies that changed symbol.** PSX files each announcement under the symbol the company had at the time, so the history also includes the company's earlier symbols (`NEWS_PREDECESSOR_SYMBOLS`), marked in `source`, e.g. `PSX (as DAWH)`. ENGROH is Dawood Hercules (DAWH) renamed in January 2025, when Engro Corporation (ENGRO) became its subsidiary and was delisted, so its history includes both. A notice that both companies filed on the same day is kept once.
+
+**Matching headlines to a company.** Names are derived from PSX's official name, for example "The Hub Power Company Limited" gives "Hub Power Company" and "Hub Power". Short names the press uses are added in `NEWS_EXTRA_NAMES` (OGDCL, HUBCO, ...), and the ticker counts only in upper case, so LUCK does not match "luck". A headline about another company with a similar name, such as Fauji **Foods** for Fauji Fertilizer, is not matched. Market news needs PSX-specific terms, because generic words like "stocks" also match "Asian stocks rally". Stored headlines are matched again with the current rules on every run, so changing the keywords in `config.py` applies to older headlines too.
+
+**Timing: why news is a slower signal than prices.** Announcements reach PSX the same day, often during trading. The press usually reports the following morning, after the price has already moved. Agent 4 should therefore treat news sentiment as a trend over days and weeks rather than a same-day trigger. How to use the table:
+
+- Use `informative` rows.
+- Weight by relevance, for example company > sector > market.
+- Weight recent items more heavily, as the proposal plans.
+- Use the long announcement history for a company's sentiment over time.
+
+Company-specific press headlines are rare: on 2026-11-24, 2 of 184 feed headlines named one of the original five companies. Official announcements are therefore the main per-company source, and sector and market headlines add context.
 
 **How it stays fast.** The agent fetches on demand:
 
@@ -109,6 +144,7 @@ All times are Pakistan time. A broad weekly schedule (`TRADING_WINDOWS`, wider t
 | `dividend_history` | ex-date | adding new dividends |
 | `income_statement`, `balance_sheet` | fiscal year + period end + metric | adding new periods; the TTM column is replaced |
 | PSX `financials`, `ratios` | period + metric | adding new periods |
+| `announcements`, `articles` (news) | article id | adding new items; headlines stay after they leave a feed |
 
 The data handed to the other agents has exactly the same columns as before; over time it simply reaches further back. Company profiles, the market listing and the KMI-30 list describe "now", so they stay in the cache only. When the PSX company page shows a reporting quarter not seen before, the statements are fetched again at once rather than at their weekly refresh.
 
@@ -133,13 +169,11 @@ python scripts/backup_history.py restore <file.zip>      # restore a backup
 
 A restore never deletes anything: the current store is first renamed to `data.before-restore-<time>`. Set the `STOCKMIND_DATA_DIR` environment variable to keep the store somewhere else.
 
-**Live prices (Market Watch), switched off until verified.** PSX's historical endpoint always returns a company's full 10-year history, so each refresh during a session downloads it again. PSX's Market Watch page lists today's open, high, low, current price and volume for every company in one request. Market Watch has no timestamp of its own, so each read is checked against PSX's homepage. Its "As of" time must be recent while trading, and Market Watch's total volume must match PSX's regular-market volume (both were exactly 620,697,365 shares after the close on 2026-11-20). After the close, Market Watch matched the official daily history exactly for every company checked. Its behaviour *during* a session has not been verified yet, so `LIVE_PRICES_ENABLED` is `False` and prices are refreshed by full downloads. To verify, run this on a trading day, before the open, and leave it running:
+**Tested against a live session.** On 2026-11-23, PSX's data was sampled every minute for a full trading day (501 samples):
 
-```powershell
-python scripts/check_market_session.py
-```
-
-It samples every minute until 17:30 PKT and writes a log and a report to `~/.stockmind/session_checks/`. The report covers the State words PSX uses, how often "As of" and Market Watch update, the volume agreement during trading, whether the daily history contains a partial bar for today, and whether the final Market Watch values match the official daily row.
+- **The normal price download is live during a session.** From the open it includes today's unfinished prices, so a fall shows up within 15 minutes (`SESSION_REFRESH`). Agent 1 warns when the latest row is unfinished, and that row is only stored in the history once the session has ended.
+- **The market clock reads PSX correctly.** PSX's State moved Ready → Pre-Open → Open (09:35) → Post-Close → Closed (15:50). Prices kept changing until Closed, and the final prices matched the official daily history for every company checked.
+- **A faster alternative was tested and dropped.** PSX's Market Watch page lists every company's current prices in one request, but it was never more up to date than the normal download (it only updates every 5 minutes). It would also have needed extra safeguards: it still shows the previous day's prices before the open, and early in the session its total volume ran up to 2.8% ahead of PSX's own figure. It was therefore removed.
 
 **Scaling to more companies.** Nothing in the code assumes five companies. To support more, add their symbols to `SUPPORTED_TICKERS` in `config.py`. Peers are found automatically from the PSX sector listing, and every source is fetched and cached per symbol, so a company that is both supported and a peer is fetched only once. `DataCollectionAgent().collect_many()` collects all supported companies in one call.
 
@@ -315,7 +349,7 @@ Unusual values will not automatically be treated as errors because genuine marke
 
 ## Known Data Limitations
 
-- Live market timing (State words, Market Watch update frequency during a session) is not yet verified; see "Live prices" above.
+- During a trading session the latest price row is today's unfinished session. Agent 1 adds a warning, and the row is not stored in the history until the session has ended.
 - History depth is set by the sources: about 10 years of prices (PSX always returns its full window), 5 years of statements, and about 5-7 years of dividends.
 - PSX `financials` can be standalone figures (e.g. ENGROH), while stockanalysis.com statements are consolidated. Do not mix them in one ratio.
 - ENGROH has no payout announcements on PSX since it was renamed from Dawood Hercules (DAWH). `dividend_history` still shows DAWH-era dividends (2019-2024), because it is the same listed company.
