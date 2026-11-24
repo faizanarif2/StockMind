@@ -1,5 +1,7 @@
 """Fetch historical PSX stock prices using psxdata."""
 
+import time
+
 import pandas as pd
 import psxdata
 
@@ -12,6 +14,13 @@ REQUIRED_COLUMNS = {
     "close",
     "volume",
 }
+
+# PSX occasionally answers with an empty price table instead of an error
+# (seen 2026-11-25 for FFL and HCAR while Stage 0 fetched all 30 KMI-30
+# companies). A listed company always has prices, so an empty full history
+# is a glitch: ask again a couple of times before giving up.
+EMPTY_RESPONSE_RETRIES = 2
+EMPTY_RESPONSE_PAUSE = 2  # seconds between attempts
 
 
 def fetch_historical_prices(
@@ -40,12 +49,20 @@ def fetch_historical_prices(
 
     # StockMind caches responses itself (see cache.py), so psxdata's
     # separate cache in ~/.psxdata is disabled to avoid two copies.
-    df = psxdata.stocks(
-        ticker,
-        start=start,
-        end=end,
-        cache=False,
-    )
+    # A date-filtered request can be genuinely empty (e.g. a holiday), so
+    # only a request for the full history is retried.
+    attempts = 1 if (start or end) else 1 + EMPTY_RESPONSE_RETRIES
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(EMPTY_RESPONSE_PAUSE)
+        df = psxdata.stocks(
+            ticker,
+            start=start,
+            end=end,
+            cache=False,
+        )
+        if not df.empty:
+            break
 
     if df.empty:
         raise ValueError(

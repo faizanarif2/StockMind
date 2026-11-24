@@ -25,6 +25,13 @@ demand from the live sources:
                            market cap, P/E, dividend yield, income statement
                            and balance sheet - for industry-average comparisons
 
+    PSX announcements      news: for the Sentiment Agent (Agent 4). The
+    + business-news RSS    company's official announcements (5 years) and
+                           headlines from Business Recorder, Dawn, Express
+                           Tribune and ProPakistani that concern the
+                           company, its sector or the whole market. One row
+                           per item, newest first; see data/news.py.
+
 Use income_statement + balance_sheet together for ratios such as ROE:
 both are consolidated. PSX `financials` can be standalone figures.
 
@@ -66,12 +73,9 @@ Market-aware refreshing and permanent history
 6. When PSX shows a reporting quarter we have not seen before, the
    financial statements are fetched again at once instead of waiting for
    their weekly refresh.
-7. With config.LIVE_PRICES_ENABLED, today's price bar comes from PSX Market
-   Watch (one request for every company) between full downloads.
 """
 
 import logging
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -81,7 +85,7 @@ import requests
 from psxdata.exceptions import PSXDataError
 
 from stockmind import config
-from stockmind.data import company, live_prices, market, stockanalysis
+from stockmind.data import company, market, news, stockanalysis
 from stockmind.data.cache import ResponseCache
 from stockmind.data.history_store import HistoryStore
 from stockmind.data.market_clock import MarketClock
@@ -131,6 +135,10 @@ class CompanyData:
     payouts: pd.DataFrame
     dividend_history: pd.DataFrame
     peers: SectorPeers
+    # Announcements and headlines for Agent 4, newest first; columns in
+    # news.NEWS_COLUMNS. Has a default so code that builds CompanyData
+    # without news (e.g. other agents' tests) keeps working.
+    news: pd.DataFrame = field(default_factory=news.empty_news)
     fetched_at: dict[str, datetime] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -165,6 +173,9 @@ PEER_SOURCES = ("income_statement", "balance_sheet")
 # Cache owner for market-wide data that is shared by every company.
 MARKET = "PSX"
 
+# Cache owner for the business-news feeds, also shared by every company.
+MEDIA = "MEDIA"
+
 
 class DataCollectionAgent:
     """Fetch, validate, and cache PSX data for the supported companies."""
@@ -193,7 +204,6 @@ class DataCollectionAgent:
         )
         self._history = history or HistoryStore(config.HISTORY_DIR)
         self._clock = clock or MarketClock()
-        self._live_lock = threading.Lock()
 
     def collect(self, ticker: str, force_refresh: bool = False) -> CompanyData:
         """
@@ -210,15 +220,19 @@ class DataCollectionAgent:
         """
         ticker = resolve_ticker(ticker, self.universe)
 
-        # The company's own sources and its sector peers are fetched together.
-        with ThreadPoolExecutor(max_workers=len(SOURCES) + 1) as pool:
+        # The company's own sources, its sector peers and its news are
+        # fetched together.
+        with ThreadPoolExecutor(max_workers=len(SOURCES) + 2) as pool:
             futures = {
                 name: pool.submit(self.load_source, ticker, name, force_refresh)
                 for name in SOURCES
             }
             peers_future = pool.submit(self._collect_peers, ticker, force_refresh)
+            news_future = pool.submit(self._collect_news, ticker,
+                                      futures["company_page"], force_refresh)
             results = {name: future.result() for name, future in futures.items()}
             peers, peer_warnings = peers_future.result()
+            company_news, news_warnings, news_fetched_at = news_future.result()
 
         # A reporting quarter we have not seen before has appeared on PSX:
         # fetch the statements now rather than at their weekly refresh.
@@ -228,10 +242,11 @@ class DataCollectionAgent:
                 results[name] = self.load_source(ticker, name, force_refresh=True)
 
         warnings = [r["warning"] for r in results.values() if r["warning"]]
-        warnings += peer_warnings
+        warnings += peer_warnings + news_warnings
         fetched_at = {
             name: r["fetched_at"] for name, r in results.items() if r["fetched_at"]
         }
+        fetched_at.update(news_fetched_at)
 
         if results["prices"]["value"] is None:
             raise DataUnavailableError(
@@ -263,6 +278,7 @@ class DataCollectionAgent:
             payouts=payouts,
             dividend_history=results["dividend_history"]["value"],
             peers=peers,
+            news=company_news,
             fetched_at=fetched_at,
             warnings=warnings,
         )
@@ -327,6 +343,71 @@ class DataCollectionAgent:
             balance_sheet=combine(statements["balance_sheet"]),
         ), warnings
 
+    def _collect_news(
+        self, ticker: str, company_page, force_refresh: bool
+    ) -> tuple[pd.DataFrame, list[str], dict[str, datetime]]:
+        """
+        Announcements and matching headlines for one company.
+
+        1. Announcement history (config.NEWS_HISTORY_YEARS): downloaded the
+           first time, then monthly; merged into the history store.
+        2. Latest announcements: hourly; merged into the history store, which
+           returns everything kept so far.
+        3. Business-news feeds: shared by all companies, every 2 hours.
+           Headlines about this company, its sector or the market are kept
+           in the history store, because feeds only show the latest ~30.
+
+        `company_page` is the future of the company-page download: matching
+        headlines needs the company's name and sector, but the downloads
+        above do not, so they run while the company page is still loading.
+        """
+        warnings: list[str] = []
+        fetched_at: dict[str, datetime] = {}
+
+        def load(owner: str, source: str, fetch, fallback):
+            result = self.load_source(owner, source, force_refresh,
+                                      fetch=fetch, fallback=fallback)
+            if result["warning"]:
+                warnings.append(result["warning"])
+            if result["fetched_at"]:
+                fetched_at[source] = result["fetched_at"]
+            return result["value"]
+
+        # Not a SOURCE_DATASETS source, so it is merged into the store here,
+        # before the latest page is loaded and merged on top of it.
+        history = load(ticker, "announcement_history",
+                       lambda t: news.fetch_announcement_history(t, config.NEWS_HISTORY_YEARS),
+                       news.empty_news())
+        if not history.empty:
+            history, info = self._history.retain(ticker, "announcements", history,
+                                                 self._clock.day_is_final)
+            warnings += info["warnings"]
+        latest = load(ticker, "announcements", news.fetch_announcements,
+                      news.empty_news())
+
+        feeds = load(MEDIA, "news_feeds", lambda _: news.fetch_feeds(),
+                     {"items": news.empty_news(), "failed": []})
+        if feeds["failed"]:
+            warnings.append("News feeds unavailable this time: "
+                            + ", ".join(feeds["failed"]) + ".")
+
+        profile = company_page.result()["value"]["profile"]
+        if not profile.get("name"):
+            warnings.append(f"{ticker}: company name unknown; headlines are "
+                            "matched by ticker only.")
+        def match(items):
+            return news.match_articles(items, ticker, profile.get("name"),
+                                       profile.get("sector"))
+
+        articles, info = self._history.retain(ticker, "articles", match(feeds["items"]),
+                                              self._clock.day_is_final)
+        warnings += info["warnings"]
+        # Stored headlines are matched again with today's rules, so a change
+        # to the keywords in config.py also applies to older headlines.
+        articles = match(articles)
+
+        return news.combine_news([latest, history, articles]), warnings, fetched_at
+
     def load_source(
         self,
         owner: str,
@@ -345,8 +426,7 @@ class DataCollectionAgent:
 
         Steps: the cache decides whether to download (market-aware for
         config.MARKET_AWARE_SOURCES); the result is merged into the history
-        store, which returns the full retained history in the same shape;
-        with live prices enabled, today's bar comes from Market Watch.
+        store, which returns the full retained history in the same shape.
         """
         if fetch is None:
             fetch, fallback = SOURCES[source]
@@ -373,11 +453,6 @@ class DataCollectionAgent:
             owner, source, result.value, self._clock.day_is_final)
         warnings += history["warnings"]
 
-        if source == "prices" and config.LIVE_PRICES_ENABLED:
-            value, live_warning = self._with_live_bar(owner, value)
-            if live_warning:
-                warnings.append(live_warning)
-
         message = " ".join(warnings) or None
         if message:
             logger.warning(message)
@@ -388,38 +463,4 @@ class DataCollectionAgent:
         """The market clock's rule for market-driven sources, else None."""
         if source not in config.MARKET_AWARE_SOURCES:
             return None
-        # With Market Watch supplying today's bar, the full price history is
-        # only needed once each session has ended.
-        interval = (None if source == "prices" and config.LIVE_PRICES_ENABLED
-                    else config.SESSION_REFRESH)
-        return lambda fetched_at: self._clock.is_fresh(fetched_at, interval)
-
-    def _with_live_bar(self, owner: str, value) -> tuple[object, str | None]:
-        """Put today's Market Watch bar on the price history, if it can be
-        trusted (see live_prices.LiveSnapshot.problem)."""
-        if value is None or not self._clock.in_window():
-            return value, None
-        with self._live_lock:  # one Market Watch read for all companies
-            try:
-                snapshot = self._cache.get_or_fetch(
-                    key=f"{MARKET}:market_watch",
-                    max_age=config.SESSION_REFRESH,
-                    fetch=live_prices.fetch_live_snapshot,
-                    fallback_errors=SOURCE_ERRORS,
-                ).value
-            except SOURCE_ERRORS as exc:
-                return value, (f"{owner}:prices: Market Watch unavailable "
-                               f"({type(exc).__name__}); using the last full download.")
-
-        problem = snapshot.problem(self._clock.now())
-        if problem:
-            return value, (f"{owner}:prices: Market Watch not used ({problem}); "
-                           "using the last full download.")
-        bar = snapshot.bar(owner)
-        prices = value["prices"]
-        if bar is None:
-            return value, None
-        if (not prices.empty and prices["date"].max() >= bar["date"]
-                and self._clock.day_is_final(bar["date"].date())):
-            return value, None  # the official final row is already there
-        return {**value, "prices": live_prices.overlay_bar(prices, bar)}, None
+        return lambda fetched_at: self._clock.is_fresh(fetched_at)

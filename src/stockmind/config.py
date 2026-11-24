@@ -169,19 +169,6 @@ MARKET_STATE_MAX_AGE = timedelta(minutes=5)
 MARKET_STATE_BOARD = "REG"
 MARKET_CLOSED_STATES = ("CLOSED", "SUSPENDED", "HALTED", "HALT")
 
-# Market Watch (today's open/high/low/current/volume for every company in
-# one request) updates today's price bar between full downloads.
-# Kept OFF until its behaviour during a live session has been verified with
-# `python scripts/check_market_session.py`. While off, prices are refreshed
-# by downloading the full history every SESSION_REFRESH during a session.
-LIVE_PRICES_ENABLED = False
-# A Market Watch read is rejected (and the full download used instead) when
-# PSX's "As of" time lags the clock by more than this during trading, or
-# when Market Watch's total volume differs from PSX's regular-market volume
-# by more than this share.
-LIVE_PRICES_MAX_LAG = timedelta(minutes=20)
-LIVE_PRICES_VOLUME_TOLERANCE = 0.02
-
 
 # ---------------------------------------------------------------------------
 # Permanent history store
@@ -204,6 +191,96 @@ HISTORY_BACKUPS_KEPT = 3
 # kept and a warning explains why.
 HISTORY_MAX_CORRECTION_SHARE = 0.05
 HISTORY_MIN_SUSPICIOUS_CHANGES = 5
+
+
+# ---------------------------------------------------------------------------
+# News (collected by Agent 1 for the Sentiment Agent, Agent 4)
+# ---------------------------------------------------------------------------
+# Sources and how items are tagged are explained in data/news.py.
+#
+# PSX company announcements: the first time a company is collected, this
+# many years of its announcements are loaded; after that only the latest
+# page is checked (CACHE_MAX_AGE["announcements"]).
+NEWS_HISTORY_YEARS = 5
+
+# PSX files each announcement under the symbol the company had at the time,
+# so a renamed or restructured company's earlier news sits under its old
+# symbols. These are added to its announcement history (tagged with the old
+# symbol in `source`). Engro Holdings (ENGROH) is Dawood Hercules (DAWH)
+# renamed in January 2025, when Engro Corporation (ENGRO) became its wholly
+# owned subsidiary: ENGRO shareholders received ENGROH shares and ENGRO was
+# delisted. DAWH is the same legal company; ENGRO is the business it now owns.
+NEWS_PREDECESSOR_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "ENGROH": ("DAWH", "ENGRO"),
+}
+
+# Business-news RSS feeds: name -> (source shown to the user, feed URL).
+# All of them allow automated access in their robots.txt (checked
+# 2026-11-25). They are shared by every company and fetched once per
+# refresh (CACHE_MAX_AGE["news_feeds"]).
+NEWS_FEEDS: dict[str, tuple[str, str]] = {
+    "brecorder-markets": ("Business Recorder", "https://www.brecorder.com/feeds/markets"),
+    "brecorder-business": ("Business Recorder", "https://www.brecorder.com/feeds/business-finance"),
+    "brecorder-latest": ("Business Recorder", "https://www.brecorder.com/feeds/latest-news"),
+    "dawn-business": ("Dawn", "https://www.dawn.com/feeds/business"),
+    "tribune-business": ("Express Tribune", "https://tribune.com.pk/feed/business"),
+    "propakistani-business": ("ProPakistani", "https://propakistani.pk/category/business/feed/"),
+}
+
+# Publisher summaries are cut to this many characters: enough context for
+# sentiment analysis, without keeping article text.
+NEWS_SUMMARY_CHARS = 400
+
+# Company names are derived from PSX's official name automatically (see
+# news.company_names). These add short names the press uses that cannot be
+# derived, e.g. "OGDCL" for OGDC.
+NEWS_EXTRA_NAMES: dict[str, tuple[str, ...]] = {
+    "OGDC": ("OGDCL",),
+    "HUBC": ("HUBCO",),
+    "MARI": ("Mari Petroleum",),
+    "ENGROH": ("Engro Corporation", "Engro Corp"),
+    "PSO": ("Pakistan State Oil",),
+    "SNGP": ("SNGPL", "Sui Northern"),
+    "SSGC": ("SSGCL", "Sui Southern"),
+}
+
+# A headline is "sector" news for a company when it uses one of its PSX
+# sector's terms. Kept deliberately specific (e.g. "banks", not "bank",
+# which would match "World Bank"). Sectors not listed get company and
+# market news only.
+NEWS_SECTOR_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "COMMERCIAL BANKS": ("banks", "banking sector", "banking industry",
+                         "Islamic banking", "bank deposits", "bank advances"),
+    "FERTILIZER": ("fertiliser", "fertilizer", "fertilisers", "fertilizers",
+                   "urea", "DAP"),
+    "OIL & GAS EXPLORATION COMPANIES": ("E&P", "exploration and production",
+                                        "oil and gas exploration", "gas discovery",
+                                        "oil discovery", "upstream"),
+    "OIL & GAS MARKETING COMPANIES": ("OMC", "OMCs", "oil marketing", "petroleum sales",
+                                      "fuel sales", "petrol prices", "diesel prices"),
+    "REFINERY": ("refinery", "refineries", "refining"),
+    "POWER GENERATION & DISTRIBUTION": ("IPP", "IPPs", "power sector", "power producers",
+                                        "circular debt", "electricity tariff",
+                                        "capacity payments"),
+    "CEMENT": ("cement",),
+    "TECHNOLOGY & COMMUNICATION": ("IT exports", "telecom", "software exports",
+                                   "tech sector"),
+    "AUTOMOBILE ASSEMBLER": ("car sales", "auto sales", "auto sector", "automobile"),
+    "PHARMACEUTICALS": ("pharma", "pharmaceutical", "drug prices"),
+    "CHEMICAL": ("chemical", "chemicals", "petrochemical", "PVC", "soda ash"),
+    "ENGINEERING": ("steel",),
+    "TEXTILE COMPOSITE": ("textile", "textiles", "apparel exports"),
+    "GLASS & CERAMICS": ("glass", "tiles", "ceramics"),
+    "INSURANCE": ("insurance", "takaful"),
+}
+
+# A headline is "market" news when it is about the Pakistani stock market as
+# a whole. Only PSX-specific terms: generic words such as "stocks" also match
+# "Asian stocks rally" or "US stocks surge" in the same feeds.
+NEWS_MARKET_KEYWORDS: tuple[str, ...] = (
+    "KSE-100", "KSE 100", "KSE100", "KMI-30", "PSX", "Pakistan Stock Exchange",
+    "bourse",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +313,13 @@ CACHE_MAX_AGE: dict[str, timedelta] = {
     "prices": timedelta(days=1),
     "company_page": timedelta(days=1),
     "payouts": timedelta(days=1),
+    # News (data/news.py). Companies file announcements during the day and
+    # they can move the price at once, so they are checked hourly. The press
+    # mostly reports the next day, so every 2 hours is enough for the feeds.
+    # The announcement history is reloaded monthly to fill any gap.
+    "announcements": timedelta(hours=1),
+    "announcement_history": timedelta(days=30),
+    "news_feeds": timedelta(hours=2),
     "index_constituents": timedelta(days=1),
     # Stage 0's result: recalculated when a session ends (see current()).
     "selection": timedelta(days=7),
