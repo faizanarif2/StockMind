@@ -96,6 +96,9 @@ DATASETS: dict[str, DatasetSpec] = {
                               compare=("value",), period="period"),
     "ratios": DatasetSpec(key=("period", "metric"), compare=("value",),
                           period="period"),
+    # News (see news.py): one record per article id, never removed.
+    "announcements": DatasetSpec(key=("article_id",), compare=("title",)),
+    "articles": DatasetSpec(key=("article_id",), compare=("title",)),
 }
 
 # Which datasets each Agent 1 source carries. A string means the source's
@@ -107,6 +110,8 @@ SOURCE_DATASETS: dict[str, tuple[tuple[str, str | None], ...]] = {
     "dividend_history": (("dividend_history", None),),
     "income_statement": (("income_statement", None),),
     "balance_sheet": (("balance_sheet", None),),
+    "announcements": (("announcements", None),),
+    "articles": (("articles", None),),
 }
 
 CORRECTION_COLUMNS = ["logged_at", "ticker", "dataset", "record", "column",

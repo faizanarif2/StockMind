@@ -66,6 +66,13 @@ def main() -> None:
         print(f"  sector peers     : {data.peers.sector} -> "
               f"{', '.join(data.peers.tickers) or 'none'} "
               f"(statements for {len(peers_with_data)})")
+        news = data.news
+        kinds = news["kind"].value_counts().to_dict()
+        relevance = news.loc[news["kind"] == "article", "relevance"].value_counts().to_dict()
+        print(f"  news             : {_span(news, 'published_at')}: "
+              f"{kinds.get('announcement', 0)} PSX announcements "
+              f"({int(news['informative'].sum())} informative items in total), "
+              f"{kinds.get('article', 0)} headlines {relevance or ''}")
         for warning in data.warnings:
             print(f"  WARNING          : {warning}")
 
