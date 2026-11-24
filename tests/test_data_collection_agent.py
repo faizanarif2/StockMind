@@ -16,7 +16,7 @@ from stockmind.agents.data_collection import (
     DataCollectionAgent,
     DataUnavailableError,
 )
-from stockmind.data import market
+from stockmind.data import market, news
 from stockmind.data.cache import ResponseCache
 from stockmind.data.tickers import UnsupportedTickerError, resolve_ticker
 
@@ -39,6 +39,35 @@ PAYOUTS = pd.DataFrame(
     {"announced_at": pd.to_datetime(["2026-09-08"]), "details": ["60% (F) (D)"],
      "cash_dividend_pct": [60.0]}
 )
+
+
+def news_rows(*rows):
+    """News items from (id, time, kind, title) tuples."""
+    return pd.DataFrame([{
+        "article_id": article_id, "published_at": pd.Timestamp(when), "kind": kind,
+        "relevance": "company" if kind == "announcement" else None,
+        "category": "operations" if kind == "announcement" else None,
+        "informative": True, "title": title, "summary": None,
+        "source": "PSX" if kind == "announcement" else "Dawn", "url": None,
+    } for article_id, when, kind, title in rows], columns=news.NEWS_COLUMNS)
+
+
+LATEST_ANNOUNCEMENTS = news_rows(("psx-2", "2026-11-20 10:00", "announcement",
+                                  "Gas discovery at new well"))
+ANNOUNCEMENT_HISTORY = news_rows(
+    ("psx-1", "2024-05-01 09:00", "announcement", "Agreement signed for new block"),
+    ("psx-2", "2026-11-20 10:00", "announcement", "Gas discovery at new well"),
+)
+FEED_ITEMS = news_rows(
+    ("rss-1", "2026-11-24 09:00", "article", "OGDC profit rises 50pc"),
+    ("rss-2", "2026-11-24 18:00", "article", "KSE-100 gains 1,000 points"),
+    ("rss-3", "2026-11-24 12:00", "article", "Cricket team wins final"),
+)
+NEWS_FAKES = {
+    "announcements": ("fetch_announcements", LATEST_ANNOUNCEMENTS),
+    "announcement_history": ("fetch_announcement_history", ANNOUNCEMENT_HISTORY),
+    "news_feeds": ("fetch_feeds", {"items": FEED_ITEMS, "failed": []}),
+}
 
 
 @pytest.fixture
@@ -69,6 +98,14 @@ def calls(monkeypatch):
 
     # By default OGDC is alone in its sector, so no peers are fetched.
     monkeypatch.setattr(market, "fetch_market_listing", lambda: LISTING.iloc[:1])
+
+    for source, (function, value) in NEWS_FAKES.items():
+        calls[source] = 0
+
+        def fetch(*args, source=source, value=value):
+            calls[source] += 1
+            return value
+        monkeypatch.setattr(news, function, fetch)
     return calls
 
 
@@ -96,7 +133,7 @@ def test_collect_returns_every_dataset(calls, agent):
     assert data.dividend_history["cash_per_share"].item() == 6.0
     # 60% of a Rs 10 face value
     assert data.payouts["cash_dividend_per_share"].item() == 6.0
-    assert set(data.fetched_at) == set(data_collection.SOURCES)
+    assert set(data.fetched_at) == set(data_collection.SOURCES) | set(NEWS_FAKES)
     assert data.warnings == []
 
 
@@ -302,3 +339,84 @@ def test_an_unfinished_session_is_flagged_and_never_stored(calls, tmp_path, monk
     assert any("session still in progress" in w for w in data.warnings)
     stored, _ = HistoryStore(config.HISTORY_DIR).load("OGDC", "prices")
     assert stored["date"].max() == pd.Timestamp("2026-10-30")
+
+
+# ---------------------------------------------------------------------------
+# News for the Sentiment Agent
+# ---------------------------------------------------------------------------
+
+def test_news_combines_announcements_and_matching_headlines(calls, agent):
+    data = agent.collect("OGDC")
+
+    assert data.news["article_id"].tolist() == ["rss-2", "rss-1", "psx-2", "psx-1"]
+    tagged = data.news.set_index("article_id")["relevance"]
+    assert tagged["rss-1"] == "company"   # names the company
+    assert tagged["rss-2"] == "market"    # KSE-100 report
+    assert "rss-3" not in tagged          # unrelated headline dropped
+    assert list(data.news.columns) == news.NEWS_COLUMNS
+
+
+def test_news_feeds_are_downloaded_once_for_all_companies(calls, agent):
+    agent.collect("OGDC")
+    agent.collect("MEBL")
+
+    assert calls["news_feeds"] == 1
+    assert calls["announcements"] == 2          # one per company
+    assert calls["announcement_history"] == 2
+
+
+def test_headlines_are_kept_after_they_leave_the_feed(calls, agent, monkeypatch):
+    agent.collect("OGDC")
+    monkeypatch.setitem(config.CACHE_MAX_AGE, "news_feeds", timedelta(0))
+    monkeypatch.setattr(news, "fetch_feeds",
+                        lambda: {"items": FEED_ITEMS.iloc[[1]], "failed": []})
+
+    data = agent.collect("OGDC")
+
+    assert {"rss-1", "rss-2"} <= set(data.news["article_id"])
+
+
+def test_news_outage_does_not_stop_collection(calls, agent, monkeypatch):
+    def offline(*args):
+        raise PSXConnectionError("PSX unreachable")
+    for function, _ in NEWS_FAKES.values():
+        monkeypatch.setattr(news, function, offline)
+
+    data = agent.collect("OGDC")
+
+    assert data.news.empty
+    assert len(data.prices) == 2
+    assert any("OGDC:announcements unavailable" in w for w in data.warnings)
+
+
+def test_failed_announcement_history_is_retried(calls, agent, monkeypatch):
+    def empty_answer(*args):
+        raise ValueError("PSX returned no announcements for OGDC")
+    monkeypatch.setattr(news, "fetch_announcement_history", empty_answer)
+    first = agent.collect("OGDC")
+    assert any("announcement_history unavailable" in w for w in first.warnings)
+
+    monkeypatch.setattr(news, "fetch_announcement_history",
+                        lambda *args: ANNOUNCEMENT_HISTORY)
+    second = agent.collect("OGDC")
+
+    assert "psx-1" in set(second.news["article_id"])
+
+
+def test_partly_failed_feeds_are_reported(calls, agent, monkeypatch):
+    monkeypatch.setattr(news, "fetch_feeds",
+                        lambda: {"items": FEED_ITEMS, "failed": ["dawn-business"]})
+
+    data = agent.collect("OGDC")
+
+    assert any("dawn-business" in w for w in data.warnings)
+
+
+def test_stored_headlines_follow_todays_matching_rules(calls, agent, monkeypatch):
+    agent.collect("OGDC")  # stores rss-2, a KSE-100 market report
+    monkeypatch.setattr(config, "NEWS_MARKET_KEYWORDS", ("bourse",))
+
+    data = agent.collect("OGDC")
+
+    assert "rss-2" not in set(data.news["article_id"])
+    assert "rss-1" in set(data.news["article_id"])
