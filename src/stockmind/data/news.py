@@ -223,7 +223,11 @@ ANNOUNCEMENT_RULES: tuple[tuple[str, bool, tuple[str, ...]], ...] = (
     ("general_meeting", False, ("GENERAL MEETING", "AGM", "EOGM", "BRIEFING",
                                 "PROXY", "POSTAL BALLOT", "ELECTRONIC VOTING",
                                 "E VOTING")),
-    ("notice", False, ("NEWSPAPER", "ADVERTISEMENT", "WITHHOLDING")),
+    # "Unusual movement in the price of the shares": PSX asks the company to
+    # confirm it has no undisclosed news; the headline says nothing about
+    # the company ("UNUSAL" is a misspelling PSX itself has published).
+    ("notice", False, ("NEWSPAPER", "ADVERTISEMENT", "WITHHOLDING",
+                       "UNUSUAL MOVEMENT", "UNUSAL MOVEMENT")),
     ("report", False, ("TRANSMISSION OF", "ANNUAL REPORT", "QUARTERLY REPORT",
                        "SHARIAH", "AUDITOR")),
     ("insider_disclosure", False, ("DISCLOSURE OF INTEREST", "TRANSACTION IN SHARES",
@@ -265,6 +269,22 @@ def classify_announcement(title: str) -> tuple[str, bool]:
 # ---------------------------------------------------------------------------
 # Publisher RSS feeds
 # ---------------------------------------------------------------------------
+
+
+def reclassify_announcements(items: pd.DataFrame) -> pd.DataFrame:
+    """
+    Classify stored announcements again with today's rules, so a change to
+    ANNOUNCEMENT_RULES also applies to announcements kept from earlier runs.
+    """
+    rows = items["kind"] == "announcement"
+    if not rows.any():
+        return items
+    items = items.copy()
+    classified = items.loc[rows, "title"].map(classify_announcement)
+    items.loc[rows, "category"] = classified.map(lambda result: result[0])
+    items.loc[rows, "informative"] = classified.map(lambda result: result[1])
+    items["informative"] = items["informative"].astype(bool)
+    return items
 
 def _session() -> requests.Session:
     """HTTP session with a browser User-Agent and automatic retries."""

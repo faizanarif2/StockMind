@@ -13,6 +13,7 @@ from stockmind.data.news import (
     parse_announcements,
     parse_feed,
     parse_total,
+    reclassify_announcements,
 )
 
 # conftest.py replaces the fetchers with "offline" stubs; keep the real ones.
@@ -101,9 +102,28 @@ def test_total_is_read_from_the_pager():
     ("SYS | Systems Limited Auditors Certificate", "report", False),
     ("Newspaper Advertisement regarding Withholding of Tax on Dividend", "notice", False),
     ("Additional Information of The Hub Power Company Limited", "material_information", False),
+    ("Unusual movement in the price of the Shares of Ghandhara Industries Limited",
+     "notice", False),
+    ("UNUSAL MOVEMENT IN PRICE OF THE SHARES OF PAKISTAN REFINERY LIMITED (PRL)",
+     "notice", False),
 ])
 def test_announcement_classification(title, category, informative):
     assert classify_announcement(title) == (category, informative)
+
+
+def test_stored_announcements_are_classified_again():
+    stored = parse_announcements(ANNOUNCEMENTS_HTML)
+    stored["category"], stored["informative"] = "other", True  # an older rule
+    headline = articles(("Unusual movement claims", "")).assign(category=None)
+    updated = reclassify_announcements(combine_news([stored, headline]))
+
+    by_title = updated.set_index("title")
+    assert by_title.loc["Dissemination of Video Recording of Corporate Briefing Session",
+                        "category"] == "general_meeting"
+    assert not by_title.loc["Dissemination of Video Recording of Corporate Briefing Session",
+                            "informative"]
+    # Press headlines are left alone.
+    assert by_title.loc["Unusual movement claims", "informative"]
 
 
 def test_history_pages_until_total(monkeypatch):

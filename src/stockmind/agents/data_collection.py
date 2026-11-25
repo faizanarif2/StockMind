@@ -406,7 +406,10 @@ class DataCollectionAgent:
         # to the keywords in config.py also applies to older headlines.
         articles = match(articles)
 
-        return news.combine_news([latest, history, articles]), warnings, fetched_at
+        # Announcements kept from earlier runs are classified again too.
+        combined = news.reclassify_announcements(
+            news.combine_news([latest, history, articles]))
+        return combined, warnings, fetched_at
 
     def load_source(
         self,

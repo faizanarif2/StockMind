@@ -107,7 +107,7 @@ Columns (`news.NEWS_COLUMNS`):
 
 **Companies that changed symbol.** PSX files each announcement under the symbol the company had at the time, so the history also includes the company's earlier symbols (`NEWS_PREDECESSOR_SYMBOLS`), marked in `source`, e.g. `PSX (as DAWH)`. ENGROH is Dawood Hercules (DAWH) renamed in January 2025, when Engro Corporation (ENGRO) became its subsidiary and was delisted, so its history includes both. A notice that both companies filed on the same day is kept once.
 
-**Matching headlines to a company.** Names are derived from PSX's official name, for example "The Hub Power Company Limited" gives "Hub Power Company" and "Hub Power". Short names the press uses are added in `NEWS_EXTRA_NAMES` (OGDCL, HUBCO, ...), and the ticker counts only in upper case, so LUCK does not match "luck". A headline about another company with a similar name, such as Fauji **Foods** for Fauji Fertilizer, is not matched. Market news needs PSX-specific terms, because generic words like "stocks" also match "Asian stocks rally". Stored headlines are matched again with the current rules on every run, so changing the keywords in `config.py` applies to older headlines too.
+**Matching headlines to a company.** Names are derived from PSX's official name, for example "The Hub Power Company Limited" gives "Hub Power Company" and "Hub Power". Short names the press uses are added in `NEWS_EXTRA_NAMES` (OGDCL, HUBCO, ...), and the ticker counts only in upper case, so LUCK does not match "luck". A headline about another company with a similar name, such as Fauji **Foods** for Fauji Fertilizer, is not matched. Market news needs PSX-specific terms, because generic words like "stocks" also match "Asian stocks rally". Stored headlines are matched again, and stored announcements classified again, with the current rules on every run, so changing the keywords applies to older items too.
 
 **Timing: why news is a slower signal than prices.** Announcements reach PSX the same day, often during trading. The press usually reports the following morning, after the price has already moved. Agent 4 should therefore treat news sentiment as a trend over days and weeks rather than a same-day trigger. How to use the table:
 
@@ -186,6 +186,7 @@ Technical, fundamental, sentiment, risk, and decision-making agents will be deve
 - stockanalysis.com (financial statements, dividend history)
 - pandas, BeautifulSoup, requests
 - diskcache (response caching)
+- PyTorch and Hugging Face Transformers (FinBERT sentiment model)
 - pytest
 - Git and GitHub
 
@@ -279,6 +280,61 @@ data.peers.market      # peers' market cap, price, P/E, dividend yield
 data.peers.balance_sheet  # peers' statements, with a "ticker" column
 data.warnings          # e.g. "OGDC:prices: source unavailable ... using data fetched at ..."
 ```
+
+## Agent 4 - Sentiment Analysis Agent (implemented)
+
+`src/stockmind/agents/sentiment_analysis.py` reads the news Agent 1 collected (PSX announcements and business-news headlines about the company, its sector and the market), judges each headline with **FinBERT**, and returns a signal for the Decision Agent. Its result has the same shape and the same signal and confidence rules as Agents 2 and 3 (`analysis/scoring.py`), so Agent 5 can combine all three directly:
+
+```text
+OGDC: BUY (17% confidence, sentiment score 64/100, positive)
+  - Company news (recent): 2 items in the last 60 days (0 positive, 0 negative, 2 neutral); recency-weighted sentiment +0.06 (neutral).
+  - Company news (past year): 33 items in the last 365 days (8 positive, 0 negative, 25 neutral); recency-weighted sentiment +0.23 (positive). Most positive: "Successful Testing and Completion of Development Well Chak 63-05" (2026-06-30).
+  - Sector news: no news in the last 30 days.
+  - Market news: 10 items in the last 14 days (4 positive, 3 negative, 3 neutral); recency-weighted sentiment +0.09 (neutral).
+```
+
+```powershell
+python scripts/analyse_sentiment.py              # the Stage 0 selection
+python scripts/analyse_sentiment.py OGDC         # one company
+python scripts/analyse_sentiment.py OGDC --headlines 10   # show more headlines
+```
+
+```python
+from stockmind.agents.data_collection import DataCollectionAgent
+from stockmind.agents.sentiment_analysis import SentimentAnalysisAgent
+
+result = SentimentAnalysisAgent().analyse(DataCollectionAgent().collect("OGDC"))
+result.signal, result.confidence, result.score   # same fields as Agents 2 and 3
+result.sentiment          # "positive", "neutral" or "negative"
+result.signals            # one row per signal: items, value, score, evidence, vote
+result.articles           # every analysed item with P(positive/negative/neutral)
+result.history            # monthly sentiment for company, sector and market news
+```
+
+**FinBERT.** FinBERT (`ProsusAI/finbert`, Araci 2019) is BERT trained further on financial text and fine-tuned on Financial PhraseBank. General sentiment models misread financial language ("costs fell" is good news), so the proposal uses FinBERT. It is used as published, with no training. For each headline it gives P(positive), P(negative) and P(neutral); the headline's sentiment is P(positive) - P(negative), from -1 to +1. It reads headlines, not summaries: headlines are what it was built for, and a summary often mentions other companies.
+
+**How the signal is made** (settings in `config.SENTIMENT_*`):
+
+| Signal | News used | Window | Half-life | Weight |
+|---|---|---|---|---|
+| `company_recent` | The company's announcements and headlines naming it | 60 days | 14 days | 0.45 |
+| `company_long_term` | The same, over the past year | 365 days | 120 days | 0.15 |
+| `sector` | Industry headlines (e.g. urea prices for a fertilizer maker) | 30 days | 7 days | 0.20 |
+| `market` | PSX market headlines (e.g. KSE-100 reports) | 14 days | 3 days | 0.20 |
+
+- **Only informative items** are used. A "Notice of Board Meeting" gives FinBERT nothing to read.
+- **Recent news counts more**, as the proposal plans: an item's weight halves every half-life.
+- **A signal's score** is its recency-weighted average sentiment / 0.5, capped at +/-1 (most financial headlines are neutral, so averages rarely come near 1).
+- **Little news means low confidence, not a confident HOLD.** A signal needs about 4 recent items to count fully; one fresh headline counts a quarter. With no news in its window a signal is skipped.
+- **Signal, confidence and the 0-100 sentiment score** follow the same rules as Agents 2 and 3: score >= 0.2 is BUY, <= -0.2 is SELL, and `confidence = 100 x coverage x (agreement + strength) / 2`.
+
+**Speed.** Each headline is analysed once and its score is remembered in `~/.stockmind/cache/sentiment` (keyed by model and text). When every headline has been seen before, the model is not even loaded and the analysis takes about 0.1 s per company (measured 2026-11-25). When there are new headlines, loading PyTorch and FinBERT takes 20-40 s once per run, then about 100 headlines are scored per second on a normal CPU. The first run downloads FinBERT (~440 MB) into the Hugging Face cache (`~/.cache/huggingface`), outside the project, and the model revision is pinned (`SENTIMENT_MODEL_REVISION`) so scores never change silently. PyTorch is installed in its CPU-only version (`requirements.txt` points pip to PyTorch's CPU package index), which is much smaller and needs no graphics card.
+
+**Timing and backtesting.** PSX announcements appear the same day; the press usually reports the next morning, after the price has moved. Read the sentiment as a trend over days and weeks rather than a same-day trigger. `analyse(data, as_of=...)` uses only news published by that date, so a backtest (Agent 7) can ask what the sentiment was at any earlier point.
+
+**Preparing the text.** Pakistani newspapers write "53pc" for "53 percent", which FinBERT does not know: "OGDC profit surges 53pc and declares dividend" scored -0.25, and +0.61 with "percent". "pc" after a number is therefore replaced before scoring.
+
+**Limitations.** Company-specific press headlines are rare, so the company signals rest mostly on PSX announcements, whose titles are short and often neutral. Many companies file only procedural titles for months (e.g. HUBC: "Financial Result for the First Quarter...", "Credit of Interim Cash Dividend"), whose content is in the PDF, so their company signals are often empty and their confidence low. FinBERT also reads plain statements of fact as neutral ("GAS/CONDENSATE DISCOVERY AT BITRISIM NORTHWEST-1..." scored +0.06), because Financial PhraseBank's annotators labelled facts neutral unless they were clearly good or bad. Low confidence is the intended result in these cases: the Decision Agent weighs each agent by its confidence. Press headlines are only kept from the first run of Agent 1, so the sector and market signals need Agent 1 to run at least daily. FinBERT reads one headline at a time and does not know which company a market report is mainly about.
 
 ## Data Quality Principles
 

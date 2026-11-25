@@ -284,6 +284,51 @@ NEWS_MARKET_KEYWORDS: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
+# Sentiment analysis (Agent 4)
+# ---------------------------------------------------------------------------
+# FinBERT (Araci, 2019): BERT trained further on financial text and
+# fine-tuned on Financial PhraseBank to label a sentence positive, negative
+# or neutral. Pinned to one revision so scores never change silently; the
+# model (~440 MB) is downloaded once into the Hugging Face cache
+# (~/.cache/huggingface), outside the project.
+SENTIMENT_MODEL = "ProsusAI/finbert"
+SENTIMENT_MODEL_REVISION = "0bc2ac10dda6929bcb1f77ccc43c7ec5c424f031"
+SENTIMENT_BATCH_SIZE = 32
+SENTIMENT_MAX_TOKENS = 64   # headlines are short; longer text is cut
+
+# Each scored signal: (weight, relevance, window in days, half-life in days).
+# A signal averages the FinBERT sentiment (P(positive) - P(negative)) of the
+# informative news items with that relevance published in the window. Newer
+# items count more: an item's weight halves every half-life (the proposal's
+# recency weighting; short-term news moves prices most, Mohan et al. 2019).
+#   company_recent     the company's own news: PSX announcements and
+#                      headlines naming it
+#   company_long_term  the tone of the company's news over the last year
+#   sector             headlines about its industry, e.g. urea prices
+#   market             headlines about the PSX as a whole
+SENTIMENT_SIGNALS: dict[str, tuple[float, str, int, float]] = {
+    "company_recent":    (0.45, "company", 60, 14),
+    "company_long_term": (0.15, "company", 365, 120),
+    "sector":            (0.20, "sector", 30, 7),
+    "market":            (0.20, "market", 14, 3),
+}
+
+# An average sentiment of +/- this much scores +/-1. Most financial
+# headlines are neutral, so averages rarely come near 1.
+SENTIMENT_SCALE = 0.5
+
+# A signal needs this many recency-weighted items to count fully; with
+# fewer it counts partly (one fresh headline counts 1/4), which lowers the
+# confidence rather than letting one headline decide.
+SENTIMENT_FULL_EVIDENCE = 4.0
+
+# Same signal and confidence rules as Agents 2 and 3: score >= +threshold
+# -> BUY, <= -threshold -> SELL, otherwise HOLD.
+SENTIMENT_SIGNAL_THRESHOLD = 0.2
+SENTIMENT_FULL_STRENGTH = 0.6
+
+
+# ---------------------------------------------------------------------------
 # Sector peers
 # ---------------------------------------------------------------------------
 # For industry comparisons, Agent 1 also fetches the financial statements of
