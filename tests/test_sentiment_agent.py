@@ -208,14 +208,55 @@ def test_missing_sector_and_market_news_is_reported(agent):
 
     items = result.signals.set_index("signal")["items"]
     assert items["sector"] == items["market"] == 0
-    assert result.warnings[0].startswith("OGDC: no recent sector or market headlines")
+    assert result.warnings == [
+        "OGDC: sector unknown, so sector news is not used.",
+        "OGDC: no market headlines in the last 14 days; no headlines are stored "
+        "yet (the press archive may have been unavailable; Agent 1 adds more each run).",
+    ]
+
+
+def test_sector_without_keywords_is_named(agent):
+    data = company(item("Profit rises", 1), item("KSE-100 gains", 1, "market"))
+    data.profile = {"sector": "CABLE & ELECTRICAL GOODS"}
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delitem(config.NEWS_SECTOR_KEYWORDS, "CABLE & ELECTRICAL GOODS")
+        result = agent.analyse(data, as_of=NOW)
+
+    assert result.warnings == [
+        "OGDC: sector news is not used: no keywords for its sector "
+        "(CABLE & ELECTRICAL GOODS) in config.NEWS_SECTOR_KEYWORDS."]
+
+
+def test_short_headline_history_is_named_only_when_it_is_the_cause(agent):
+    data = company(item("Profit rises", 1), item("KSE-100 gains", 3, "market"))
+    data.profile = {"sector": "CEMENT"}
+    short = agent.analyse(data, as_of=NOW)
+    assert short.warnings == [
+        f"OGDC: no CEMENT sector headlines in the last 30 days; headlines are stored "
+        f"only since {NOW - pd.Timedelta(days=3):%Y-%m-%d} (the press archive may have "
+        "been unavailable; Agent 1 adds more each run)."]
+
+    data.news = pd.concat([data.news, pd.DataFrame(
+        [item("KSE-100 falls", 200, "market")], columns=news.NEWS_COLUMNS)])
+    long = agent.analyse(data, as_of=NOW)
+    assert long.warnings == ["OGDC: no CEMENT sector headlines in the last 30 days."]
 
 
 def test_old_company_news_only_counts_in_the_long_term_signal(agent):
     result = agent.analyse(company(item("Profit rises", 200)), as_of=NOW)
     items = result.signals.set_index("signal")["items"]
     assert (items["company_recent"], items["company_long_term"]) == (0, 1)
-    assert any("no company news in the last 60 days" in w for w in result.warnings)
+    assert any("no informative company news in the last 60 days;" in w
+               for w in result.warnings)
+
+
+def test_procedural_notices_are_named_as_the_reason(agent):
+    result = agent.analyse(company(item("Profit rises", 200),
+                                   item("Notice of Board Meeting", 5, informative=False)),
+                           as_of=NOW)
+    assert any("no informative company news in the last 60 days (only 1 procedural "
+               "notice, e.g. board meetings, which carry no sentiment)" in w
+               for w in result.warnings)
 
 
 def test_as_of_ignores_later_news(agent):
@@ -251,3 +292,11 @@ def test_monthly_history(agent):
 def test_recency_weights_halve_every_half_life():
     weights = recency_weights(pd.Series([0.0, 7.0, 14.0, -1.0]), half_life=7)
     assert weights.tolist() == [1.0, 0.5, 0.25, 1.0]
+
+
+def test_summary_says_when_there_is_no_company_news(agent):
+    result = agent.analyse(company(*[item(f"KSE-100 gains {i}", 1, "market")
+                                     for i in range(4)]), as_of=NOW)
+
+    assert ("There is no informative news about OGDC itself, so this reflects "
+            "only market news.") in result.summary

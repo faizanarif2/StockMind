@@ -161,7 +161,7 @@ class SentimentAnalysisAgent:
                 f"{data.ticker}: no informative news could be analysed."])
 
         signals = self._score_signals(articles, as_of)
-        warnings += self._coverage_warnings(data.ticker, signals)
+        warnings += self._coverage_warnings(data, signals, as_of)
         score, coverage, agreement = combine(signals, config.SENTIMENT_SIGNAL_THRESHOLD)
         signal, confidence = signal_confidence(
             score, coverage, agreement,
@@ -244,20 +244,52 @@ class SentimentAnalysisAgent:
         return comment
 
     @staticmethod
-    def _coverage_warnings(ticker: str, signals: pd.DataFrame) -> list[str]:
-        missing = signals.loc[signals["items"] == 0, "signal"].tolist()
+    def _coverage_warnings(
+        data: CompanyData, signals: pd.DataFrame, as_of: pd.Timestamp
+    ) -> list[str]:
+        """Why a signal has no news, so the cause can be fixed if it can be."""
+        ticker, news = data.ticker, data.news
+        missing = set(signals.loc[signals["items"] == 0, "signal"])
+        ages = (as_of - news["published_at"]) / pd.Timedelta(days=1)
         warnings = []
-        headlines = [name for name in ("sector", "market") if name in missing]
-        if headlines:
-            warnings.append(
-                f"{ticker}: no recent {' or '.join(headlines)} headlines. Agent 1 "
-                "keeps headlines from the day it first runs, so run it regularly "
-                "(at least daily) to build them up.")
+
         if "company_recent" in missing:
-            warnings.append(
-                f"{ticker}: no company news in the last "
-                f"{config.SENTIMENT_SIGNALS['company_recent'][2]} days; the "
-                "sentiment signal rests on older or wider news.")
+            window = config.SENTIMENT_SIGNALS["company_recent"][2]
+            notices = int(((news["relevance"] == "company") & ~news["informative"].astype(bool)
+                           & (ages >= 0) & (ages <= window)).sum())
+            reason = (f" (only {notices} procedural notice{'s' if notices != 1 else ''}, "
+                      "e.g. board meetings, which carry no sentiment)" if notices else "")
+            warnings.append(f"{ticker}: no informative company news in the last "
+                            f"{window} days{reason}; the signal rests on older or "
+                            "wider news.")
+
+        # Headlines: is the cause the configuration or a short history?
+        headlines = news.loc[news["kind"] == "article", "published_at"]
+        for name in ("sector", "market"):
+            if name not in missing:
+                continue
+            window = config.SENTIMENT_SIGNALS[name][2]
+            if name == "sector":
+                sector = (data.profile or {}).get("sector")
+                if not sector:
+                    warnings.append(f"{ticker}: sector unknown, so sector news is not used.")
+                    continue
+                if sector not in config.NEWS_SECTOR_KEYWORDS:
+                    warnings.append(
+                        f"{ticker}: sector news is not used: no keywords for its "
+                        f"sector ({sector}) in config.NEWS_SECTOR_KEYWORDS.")
+                    continue
+                what = f"{sector} sector headlines"
+            else:
+                what = "market headlines"
+            message = f"{ticker}: no {what} in the last {window} days"
+            since = headlines.min() if not headlines.empty else None
+            if since is None or since > as_of - pd.Timedelta(days=window):
+                stored = (f"headlines are stored only since {since:%Y-%m-%d}"
+                          if since is not None else "no headlines are stored yet")
+                message += (f"; {stored} (the press archive may have been "
+                            "unavailable; Agent 1 adds more each run)")
+            warnings.append(message + ".")
         return warnings
 
     @staticmethod
@@ -309,6 +341,11 @@ class SentimentAnalysisAgent:
             parts.append("Positive: " + ", ".join(positive) + ".")
         if negative:
             parts.append("Negative: " + ", ".join(negative) + ".")
+        used = scored[scored["evidence"] > 0]
+        if not used["signal"].str.startswith("company").any():
+            parts.append(f"There is no informative news about {result.ticker} "
+                         "itself, so this reflects only "
+                         + " and ".join(label.lower() for label in used["label"]) + ".")
         parts.append(f"Sentiment signal: {result.signal} with "
                      f"{result.confidence:.0f}% confidence.")
         return " ".join(parts)

@@ -68,6 +68,8 @@ class FinBERT:
             import torch  # noqa: F401  (imported here: slow to import)
             from transformers import (AutoModelForSequenceClassification,
                                       AutoTokenizer)
+            from transformers.utils import logging as transformers_logging
+            transformers_logging.disable_progress_bar()   # no "Loading weights" bar
         except ImportError as exc:
             raise ModelUnavailableError(
                 "PyTorch and Transformers are not installed "

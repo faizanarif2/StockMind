@@ -63,10 +63,24 @@ FEED_ITEMS = news_rows(
     ("rss-2", "2026-11-24 18:00", "article", "KSE-100 gains 1,000 points"),
     ("rss-3", "2026-11-24 12:00", "article", "Cricket team wins final"),
 )
+TRIBUNE = "https://tribune.com.pk/story/{}/{}"
+# Press archive: one story also in the feed (rss-4 has the same address),
+# one cement story, and one that is about cricket.
+FEED_ITEMS = pd.concat([FEED_ITEMS, news_rows(
+    ("rss-4", "2026-11-23 20:00", "article", "OGDC wins exploration block"),
+).assign(url=TRIBUNE.format(5, "ogdc-wins-block"))], ignore_index=True)
+ARCHIVE_ITEMS = news_rows(
+    ("archive-1", "2026-11-23 23:59:59", "article", "Ogdc wins block"),
+    ("archive-2", "2026-03-02 23:59:59", "article", "Ogdc plans partnerships in libya"),
+    ("archive-3", "2026-03-01 23:59:59", "article", "Bethell looks to cement place"),
+).assign(url=[TRIBUNE.format(5, "ogdc-wins-block"), TRIBUNE.format(2, "ogdc-plans"),
+              TRIBUNE.format(1, "bethell")], source="Express Tribune")
 NEWS_FAKES = {
     "announcements": ("fetch_announcements", LATEST_ANNOUNCEMENTS),
     "announcement_history": ("fetch_announcement_history", ANNOUNCEMENT_HISTORY),
     "news_feeds": ("fetch_feeds", {"items": FEED_ITEMS, "failed": []}),
+    "press_archive": ("fetch_press_archive", ARCHIVE_ITEMS),
+    "press_latest": ("fetch_press_latest", ARCHIVE_ITEMS.iloc[:1]),
 }
 
 
@@ -348,7 +362,8 @@ def test_an_unfinished_session_is_flagged_and_never_stored(calls, tmp_path, monk
 def test_news_combines_announcements_and_matching_headlines(calls, agent):
     data = agent.collect("OGDC")
 
-    assert data.news["article_id"].tolist() == ["rss-2", "rss-1", "psx-2", "psx-1"]
+    assert data.news["article_id"].tolist() == [
+        "rss-2", "rss-1", "rss-4", "psx-2", "archive-2", "psx-1"]
     tagged = data.news.set_index("article_id")["relevance"]
     assert tagged["rss-1"] == "company"   # names the company
     assert tagged["rss-2"] == "market"    # KSE-100 report
@@ -410,6 +425,25 @@ def test_partly_failed_feeds_are_reported(calls, agent, monkeypatch):
     data = agent.collect("OGDC")
 
     assert any("dawn-business" in w for w in data.warnings)
+
+
+def test_press_archive_adds_older_headlines(calls, agent):
+    data = agent.collect("OGDC")
+    ids = set(data.news["article_id"])
+
+    assert "archive-2" in ids          # "Ogdc plans ...": ticker in any case
+    assert "archive-3" not in ids      # not about OGDC
+    # The same story in the feed and the archive is kept once, from the feed.
+    assert "rss-4" in ids and "archive-1" not in ids
+    assert calls["press_archive"] == 1 and calls["press_latest"] == 1
+
+
+def test_press_archive_is_shared_by_every_company(calls, agent):
+    agent.collect("OGDC")
+    agent.collect("MEBL")
+
+    assert calls["press_archive"] == 1
+    assert calls["press_latest"] == 1
 
 
 def test_stored_headlines_follow_todays_matching_rules(calls, agent, monkeypatch):

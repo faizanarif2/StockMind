@@ -27,10 +27,11 @@ demand from the live sources:
 
     PSX announcements      news: for the Sentiment Agent (Agent 4). The
     + business-news RSS    company's official announcements (5 years) and
-                           headlines from Business Recorder, Dawn, Express
+    + press archive        headlines from Business Recorder, Dawn, Express
                            Tribune and ProPakistani that concern the
-                           company, its sector or the whole market. One row
-                           per item, newest first; see data/news.py.
+                           company, its sector or the whole market (a year
+                           of Express Tribune headlines from the first run).
+                           One row per item, newest first; see data/news.py.
 
 Use income_statement + balance_sheet together for ratios such as ROE:
 both are consolidated. PSX `financials` can be standalone figures.
@@ -356,6 +357,9 @@ class DataCollectionAgent:
         3. Business-news feeds: shared by all companies, every 2 hours.
            Headlines about this company, its sector or the market are kept
            in the history store, because feeds only show the latest ~30.
+        4. Press archive (config.NEWS_PRESS_ARCHIVE): shared by all
+           companies; a year of headlines monthly, the newest page twice a
+           day. Matching headlines are kept like the feeds' ones.
 
         `company_page` is the future of the company-page download: matching
         headlines needs the company's name and sector, but the downloads
@@ -390,6 +394,12 @@ class DataCollectionAgent:
         if feeds["failed"]:
             warnings.append("News feeds unavailable this time: "
                             + ", ".join(feeds["failed"]) + ".")
+        archive = load(MEDIA, "press_archive",
+                       lambda _: news.fetch_press_archive(config.NEWS_PRESS_HISTORY_DAYS),
+                       news.empty_news())
+        archive_latest = load(MEDIA, "press_latest",
+                              lambda _: news.fetch_press_latest(),
+                              news.empty_news())
 
         profile = company_page.result()["value"]["profile"]
         if not profile.get("name"):
@@ -399,7 +409,8 @@ class DataCollectionAgent:
             return news.match_articles(items, ticker, profile.get("name"),
                                        profile.get("sector"))
 
-        articles, info = self._history.retain(ticker, "articles", match(feeds["items"]),
+        headlines = news.combine_news([feeds["items"], archive_latest, archive])
+        articles, info = self._history.retain(ticker, "articles", match(headlines),
                                               self._clock.day_is_final)
         warnings += info["warnings"]
         # Stored headlines are matched again with today's rules, so a change

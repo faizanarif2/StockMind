@@ -76,7 +76,7 @@ Limitations: past performance does not predict future performance, so this is a 
 | `balance_sheet` | Consolidated assets, liabilities, shareholders' equity, debt, book value per share | 5 years | stockanalysis.com |
 | `dividend_history` | Cash dividend per share with ex, record and pay dates | ~5-7 years | stockanalysis.com |
 | `peers` | Sector name, the largest other companies in the same PSX sector, their market cap / price / P/E / dividend yield, and their income statements and balance sheets | 5 years | PSX listing + stockanalysis.com |
-| `news` | For the Sentiment Agent: the company's official announcements and business-news headlines about the company, its sector or the market, tagged for relevance (see below) | 5 years of announcements; headlines from the first run on | PSX announcements + Business Recorder, Dawn, Express Tribune, ProPakistani |
+| `news` | For the Sentiment Agent: the company's official announcements and business-news headlines about the company, its sector or the market, tagged for relevance (see below) | 5 years of announcements; a year of press headlines from the first run, then everything kept | PSX announcements + Business Recorder, Dawn, Express Tribune, ProPakistani + Express Tribune archive |
 
 Amounts are in PKR thousands, per-share values in PKR. For ratios such as ROE, use `income_statement` and `balance_sheet` together: both are consolidated, so they are consistent with each other.
 
@@ -88,14 +88,15 @@ Amounts are in PKR thousands, per-share values in PKR. For ratios such as ROE, u
 |---|---|---|---|
 | PSX company announcements (`dps.psx.com.pk/announcements`) | Official disclosures the company files itself, e.g. results, dividends, "Gas/condensate discovery at Bitrisim Northwest-1", buy-backs, board changes. Timestamped to the minute, published the same day. | 5 years (`NEWS_HISTORY_YEARS`), loaded the first time a company is collected | hourly |
 | Business-news RSS feeds (`NEWS_FEEDS`): Business Recorder, Dawn, Express Tribune, ProPakistani | What the press reports. One download serves every company. | Feeds show only their latest ~30 headlines, so headlines are kept from the first run onwards | every 2 hours |
+| Press archive (`NEWS_PRESS_ARCHIVE`): Express Tribune's sitemap | Every story the paper published in the last year (`NEWS_PRESS_HISTORY_DAYS`), so sector and market news exist from the first run instead of building up from the feeds. About 2.5 MB compressed | 1 year, loaded on the first run | newest page twice a day, the whole year monthly |
 
-Every source allows automated access in its robots.txt and needs no API key. Sources tested and rejected: Google News search feeds (robots.txt forbids automated access), the GDELT news API (12-17 s per request, rate-limited, almost no PSX coverage), and the text inside announcement PDFs (mostly scanned images with no text, up to 90 s to download).
+Every source allows automated access in its robots.txt and needs no API key. Sources tested and rejected: Google News search feeds (robots.txt forbids automated access), Business Recorder's search (also forbidden), ProPakistani's older feed pages (one week is ~20 pages, so a year would take ~1,000 requests), the GDELT news API (12-17 s per request, rate-limited, almost no PSX coverage), and the text inside announcement PDFs (mostly scanned images with no text, up to 90 s to download).
 
 Columns (`news.NEWS_COLUMNS`):
 
 | Column | Meaning |
 |---|---|
-| `article_id` | Stable id (`psx-<PSX document number>` or `rss-<hash of the link>`), so nothing is stored or analysed twice |
+| `article_id` | Stable id (`psx-<PSX document number>`, `rss-<hash of the link>` or `archive-<hash of the link>`), so nothing is stored or analysed twice |
 | `published_at` | Pakistan time, like every other date in StockMind |
 | `kind` | `announcement` (PSX) or `article` (press) |
 | `relevance` | `company` (names the company: every announcement, and headlines using one of its names or its ticker), `sector` (an industry term from `NEWS_SECTOR_KEYWORDS`, e.g. urea for fertilizer makers), `market` (the PSX as a whole, e.g. KSE-100 reports) |
@@ -108,6 +109,14 @@ Columns (`news.NEWS_COLUMNS`):
 **Companies that changed symbol.** PSX files each announcement under the symbol the company had at the time, so the history also includes the company's earlier symbols (`NEWS_PREDECESSOR_SYMBOLS`), marked in `source`, e.g. `PSX (as DAWH)`. ENGROH is Dawood Hercules (DAWH) renamed in January 2025, when Engro Corporation (ENGRO) became its subsidiary and was delisted, so its history includes both. A notice that both companies filed on the same day is kept once.
 
 **Matching headlines to a company.** Names are derived from PSX's official name, for example "The Hub Power Company Limited" gives "Hub Power Company" and "Hub Power". Short names the press uses are added in `NEWS_EXTRA_NAMES` (OGDCL, HUBCO, ...), and the ticker counts only in upper case, so LUCK does not match "luck". A headline about another company with a similar name, such as Fauji **Foods** for Fauji Fertilizer, is not matched. Market news needs PSX-specific terms, because generic words like "stocks" also match "Asian stocks rally". Stored headlines are matched again, and stored announcements classified again, with the current rules on every run, so changing the keywords applies to older items too.
+
+**The press archive.** A sitemap lists each story's web address and the day it was last modified, not its headline or publication time. Agent 1 therefore:
+- reads the headline from the address: `.../story/2585222/cement-sales-grow-97-to-258m-tonnes` gives "Cement sales grow 97 to 258m tonnes" (lower case, and "9.7" becomes "97");
+- estimates the publication day: an old story edited today would otherwise look like today's news (2.7% of stories). Story numbers follow publication order, so a story was published no later than any later story was last modified. Checked against the RSS feeds' exact times, the estimate is the correct day or the next, never earlier. The time is set to the end of that day, so a backtest never sees a story before it could have been read;
+- applies two extra matching rules, because the archive covers every section of the paper in lower case. The ticker matches in any case ("Ogdc plans partnerships in Libya") unless it is an ordinary word (`NEWS_WORD_TICKERS`: LUCK, ...). A sector keyword needs a business term with it (`NEWS_BUSINESS_TERMS`), so "Bethell looks to cement place" (cricket) is not cement news;
+- keeps a story found both in a feed and in the archive once, as the feed version with its real headline and time.
+
+The archive is mostly general news: of its ~57,000 stories a year, about 500 are PSX market reports, and sector stories number in the tens (e.g. ~30 on fertiliser). Stories naming a company are rare (OGDC: about 25).
 
 **Timing: why news is a slower signal than prices.** Announcements reach PSX the same day, often during trading. The press usually reports the following morning, after the price has already moved. Agent 4 should therefore treat news sentiment as a trend over days and weeks rather than a same-day trigger. How to use the table:
 
@@ -286,12 +295,15 @@ data.warnings          # e.g. "OGDC:prices: source unavailable ... using data fe
 `src/stockmind/agents/sentiment_analysis.py` reads the news Agent 1 collected (PSX announcements and business-news headlines about the company, its sector and the market), judges each headline with **FinBERT**, and returns a signal for the Decision Agent. Its result has the same shape and the same signal and confidence rules as Agents 2 and 3 (`analysis/scoring.py`), so Agent 5 can combine all three directly:
 
 ```text
-OGDC: BUY (17% confidence, sentiment score 64/100, positive)
+OGDC: BUY (29% confidence, sentiment score 67/100, positive)
   - Company news (recent): 2 items in the last 60 days (0 positive, 0 negative, 2 neutral); recency-weighted sentiment +0.06 (neutral).
-  - Company news (past year): 33 items in the last 365 days (8 positive, 0 negative, 25 neutral); recency-weighted sentiment +0.23 (positive). Most positive: "Successful Testing and Completion of Development Well Chak 63-05" (2026-06-30).
+  - Company news (past year): 59 items in the last 365 days (18 positive, 1 negative, 40 neutral); recency-weighted sentiment +0.25 (positive). Most positive: "Ogdc turns to us firm to boost oil output" (2026-09-02).
   - Sector news: no news in the last 30 days.
-  - Market news: 10 items in the last 14 days (4 positive, 3 negative, 3 neutral); recency-weighted sentiment +0.09 (neutral).
+  - Market news: 27 items in the last 14 days (14 positive, 10 negative, 3 neutral); recency-weighted sentiment +0.14 (positive).
+  WARNING: OGDC: no OIL & GAS EXPLORATION COMPANIES sector headlines in the last 30 days.
 ```
+
+**Warnings name the cause** of a missing signal, so it can be fixed when it can be: procedural notices only ("only 14 procedural notices, e.g. board meetings"), a sector with no keywords in `NEWS_SECTOR_KEYWORDS`, or headlines stored for less time than the signal's window. When nothing is known about the company itself, the summary says the result reflects only sector or market news.
 
 ```powershell
 python scripts/analyse_sentiment.py              # the Stage 0 selection
@@ -328,13 +340,13 @@ result.history            # monthly sentiment for company, sector and market new
 - **Little news means low confidence, not a confident HOLD.** A signal needs about 4 recent items to count fully; one fresh headline counts a quarter. With no news in its window a signal is skipped.
 - **Signal, confidence and the 0-100 sentiment score** follow the same rules as Agents 2 and 3: score >= 0.2 is BUY, <= -0.2 is SELL, and `confidence = 100 x coverage x (agreement + strength) / 2`.
 
-**Speed.** Each headline is analysed once and its score is remembered in `~/.stockmind/cache/sentiment` (keyed by model and text). When every headline has been seen before, the model is not even loaded and the analysis takes about 0.1 s per company (measured 2026-11-25). When there are new headlines, loading PyTorch and FinBERT takes 20-40 s once per run, then about 100 headlines are scored per second on a normal CPU. The first run downloads FinBERT (~440 MB) into the Hugging Face cache (`~/.cache/huggingface`), outside the project, and the model revision is pinned (`SENTIMENT_MODEL_REVISION`) so scores never change silently. PyTorch is installed in its CPU-only version (`requirements.txt` points pip to PyTorch's CPU package index), which is much smaller and needs no graphics card.
+**Speed.** Each headline is analysed once and its score is remembered in `~/.stockmind/cache/sentiment` (keyed by model and text). When every headline has been seen before, the model is not even loaded and the analysis takes about 0.1 s per company (measured 2026-11-25); Agent 1's collection takes about 1.5 s per company with a cached press archive. When there are new headlines, loading PyTorch and FinBERT takes 20-40 s once per run, then about 100 headlines are scored per second on a normal CPU. The first run downloads FinBERT (~440 MB) into the Hugging Face cache (`~/.cache/huggingface`), outside the project, and the model revision is pinned (`SENTIMENT_MODEL_REVISION`) so scores never change silently. PyTorch is installed in its CPU-only version (`requirements.txt` points pip to PyTorch's CPU package index), which is much smaller and needs no graphics card.
 
 **Timing and backtesting.** PSX announcements appear the same day; the press usually reports the next morning, after the price has moved. Read the sentiment as a trend over days and weeks rather than a same-day trigger. `analyse(data, as_of=...)` uses only news published by that date, so a backtest (Agent 7) can ask what the sentiment was at any earlier point.
 
 **Preparing the text.** Pakistani newspapers write "53pc" for "53 percent", which FinBERT does not know: "OGDC profit surges 53pc and declares dividend" scored -0.25, and +0.61 with "percent". "pc" after a number is therefore replaced before scoring.
 
-**Limitations.** Company-specific press headlines are rare, so the company signals rest mostly on PSX announcements, whose titles are short and often neutral. Many companies file only procedural titles for months (e.g. HUBC: "Financial Result for the First Quarter...", "Credit of Interim Cash Dividend"), whose content is in the PDF, so their company signals are often empty and their confidence low. FinBERT also reads plain statements of fact as neutral ("GAS/CONDENSATE DISCOVERY AT BITRISIM NORTHWEST-1..." scored +0.06), because Financial PhraseBank's annotators labelled facts neutral unless they were clearly good or bad. Low confidence is the intended result in these cases: the Decision Agent weighs each agent by its confidence. Press headlines are only kept from the first run of Agent 1, so the sector and market signals need Agent 1 to run at least daily. FinBERT reads one headline at a time and does not know which company a market report is mainly about.
+**Limitations.** Company-specific press headlines are rare, so the company signals rest mostly on PSX announcements, whose titles are short and often neutral. Many companies file only procedural titles for months (e.g. HUBC: "Financial Result for the First Quarter...", "Credit of Interim Cash Dividend"), whose content is in the PDF, so their company signals are often empty and their confidence low. FinBERT also reads plain statements of fact as neutral ("GAS/CONDENSATE DISCOVERY AT BITRISIM NORTHWEST-1..." scored +0.06), because Financial PhraseBank's annotators labelled facts neutral unless they were clearly good or bad. Low confidence is the intended result in these cases: the Decision Agent weighs each agent by its confidence. The press archive fills the market signal from the first run, but sector headlines are few (often none in a 30-day window), and a company with no informative news of its own gets a result from market news alone, at low confidence (e.g. HUBC: BUY, 15%). FinBERT reads one headline at a time and does not know which company a market report is mainly about.
 
 ## Data Quality Principles
 

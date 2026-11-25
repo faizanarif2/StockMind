@@ -36,7 +36,8 @@ def offline_news(monkeypatch):
     """News sources are unavailable unless a test provides fakes."""
     def offline(*args, **kwargs):
         raise PSXConnectionError("tests run offline")
-    for name in ("fetch_announcements", "fetch_announcement_history", "fetch_feeds"):
+    for name in ("fetch_announcements", "fetch_announcement_history", "fetch_feeds",
+                 "fetch_press_archive", "fetch_press_latest"):
         monkeypatch.setattr(news, name, offline)
 
 
