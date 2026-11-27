@@ -238,7 +238,7 @@ NEWS_EXTRA_NAMES: dict[str, tuple[str, ...]] = {
     "OGDC": ("OGDCL",),
     "HUBC": ("HUBCO",),
     "MARI": ("Mari Petroleum",),
-    "ENGROH": ("Engro Corporation", "Engro Corp"),
+    "ENGROH": ("Engro Corporation", "Engro Corp", "Engro"),  # holding company of the Engro group
     "PSO": ("Pakistan State Oil",),
     "SNGP": ("SNGPL", "Sui Northern"),
     "SSGC": ("SSGCL", "Sui Southern"),
@@ -272,6 +272,16 @@ NEWS_SECTOR_KEYWORDS: dict[str, tuple[str, ...]] = {
     "TEXTILE COMPOSITE": ("textile", "textiles", "apparel exports"),
     "GLASS & CERAMICS": ("glass", "tiles", "ceramics"),
     "INSURANCE": ("insurance", "takaful"),
+    "CABLE & ELECTRICAL GOODS": ("home appliances", "electrical appliances",
+                                 "electrical goods", "electronics industry",
+                                 "air conditioners", "refrigerators", "transformers"),
+    "FOOD & PERSONAL CARE PRODUCTS": ("FMCG", "consumer goods", "food industry",
+                                      "packaged food", "edible oil", "cooking oil",
+                                      "ghee", "personal care"),
+    "INV. BANKS / INV. COS. / SECURITIES COS.": ("brokerage", "brokerages",
+                                                 "brokerage houses", "mutual funds",
+                                                 "asset management", "investment banks",
+                                                 "securities firms"),
 }
 
 # A headline is "market" news when it is about the Pakistani stock market as
@@ -281,6 +291,84 @@ NEWS_MARKET_KEYWORDS: tuple[str, ...] = (
     "KSE-100", "KSE 100", "KSE100", "KMI-30", "PSX", "Pakistan Stock Exchange",
     "bourse",
 )
+
+# Press archive: Express Tribune's sitemap lists every story it has
+# published, newest first, 25,000 per file (about 5 months), each with its
+# web address (whose last part is the headline) and the date it was last
+# modified. robots.txt allows it (checked 2026-11-25). It gives a year of
+# press headlines on the very first run, so the sector and market signals
+# do not have to wait for the RSS feeds above to build up. The first page
+# (CACHE_MAX_AGE["press_latest"]) keeps it up to date.
+NEWS_PRESS_ARCHIVE: tuple[str, str] = (
+    "Express Tribune", "https://tribune.com.pk/sitemap/posts-{page}.xml")
+NEWS_PRESS_HISTORY_DAYS = 365
+
+# Archive headlines come from web addresses ("cement-sales-grow-97-to-258m-
+# tonnes"), so capitals and punctuation are lost, and the sitemap covers
+# every section of the paper, not just business. Two rules keep matching
+# accurate for them:
+# - A sector keyword only counts together with one of these business terms,
+#   so "Bethell looks to cement place" (cricket) is not cement news.
+NEWS_BUSINESS_TERMS: tuple[str, ...] = (
+    "price", "prices", "sales", "exports", "imports", "production", "output",
+    "demand", "supply", "profit", "profits", "earnings", "revenue", "tariff",
+    "tariffs", "tax", "taxes", "duty", "budget", "investment", "investors",
+    "billion", "million", "bn", "growth", "industry", "sector", "companies",
+    "capacity", "despatches", "dispatches", "imf", "sbp", "gdp", "inflation",
+    "shares", "stocks", "market", "subsidy", "deficit", "debt", "loans",
+    "financing", "plant", "plants", "rs",
+)
+# - A ticker is matched in any case ("ogdc plans partnerships"), except
+#   tickers that are also ordinary words; those still need capitals, so
+#   "luck" in a headline is not Lucky Cement.
+NEWS_WORD_TICKERS: tuple[str, ...] = (
+    "LUCK", "MARI", "PACE", "LOADS", "POWER", "GAL", "TELE", "AIRLINK",
+)
+
+
+# ---------------------------------------------------------------------------
+# Sentiment analysis (Agent 4)
+# ---------------------------------------------------------------------------
+# FinBERT (Araci, 2019): BERT trained further on financial text and
+# fine-tuned on Financial PhraseBank to label a sentence positive, negative
+# or neutral. Pinned to one revision so scores never change silently; the
+# model (~440 MB) is downloaded once into the Hugging Face cache
+# (~/.cache/huggingface), outside the project.
+SENTIMENT_MODEL = "ProsusAI/finbert"
+SENTIMENT_MODEL_REVISION = "0bc2ac10dda6929bcb1f77ccc43c7ec5c424f031"
+SENTIMENT_BATCH_SIZE = 32
+SENTIMENT_MAX_TOKENS = 64   # headlines are short; longer text is cut
+
+# Each scored signal: (weight, relevance, window in days, half-life in days).
+# A signal averages the FinBERT sentiment (P(positive) - P(negative)) of the
+# informative news items with that relevance published in the window. Newer
+# items count more: an item's weight halves every half-life (the proposal's
+# recency weighting; short-term news moves prices most, Mohan et al. 2019).
+#   company_recent     the company's own news: PSX announcements and
+#                      headlines naming it
+#   company_long_term  the tone of the company's news over the last year
+#   sector             headlines about its industry, e.g. urea prices
+#   market             headlines about the PSX as a whole
+SENTIMENT_SIGNALS: dict[str, tuple[float, str, int, float]] = {
+    "company_recent":    (0.45, "company", 60, 14),
+    "company_long_term": (0.15, "company", 365, 120),
+    "sector":            (0.20, "sector", 30, 7),
+    "market":            (0.20, "market", 14, 3),
+}
+
+# An average sentiment of +/- this much scores +/-1. Most financial
+# headlines are neutral, so averages rarely come near 1.
+SENTIMENT_SCALE = 0.5
+
+# A signal needs this many recency-weighted items to count fully; with
+# fewer it counts partly (one fresh headline counts 1/4), which lowers the
+# confidence rather than letting one headline decide.
+SENTIMENT_FULL_EVIDENCE = 4.0
+
+# Same signal and confidence rules as Agents 2 and 3: score >= +threshold
+# -> BUY, <= -threshold -> SELL, otherwise HOLD.
+SENTIMENT_SIGNAL_THRESHOLD = 0.2
+SENTIMENT_FULL_STRENGTH = 0.6
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +458,10 @@ CACHE_MAX_AGE: dict[str, timedelta] = {
     "announcements": timedelta(hours=1),
     "announcement_history": timedelta(days=30),
     "news_feeds": timedelta(hours=2),
+    # The press archive's first page (about 800 KB compressed) twice a day;
+    # the whole year (about 2.5 MB) monthly, for companies added later.
+    "press_latest": timedelta(hours=12),
+    "press_archive": timedelta(days=30),
     "index_constituents": timedelta(days=1),
     # Stage 0's result: recalculated when a session ends (see current()).
     "selection": timedelta(days=7),

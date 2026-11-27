@@ -9,15 +9,20 @@ from stockmind.data.news import (
     classify_announcement,
     combine_news,
     company_names,
+    estimate_publication_days,
+    headline_from_url,
     match_articles,
     parse_announcements,
     parse_feed,
+    parse_sitemap,
     parse_total,
+    reclassify_announcements,
 )
 
 # conftest.py replaces the fetchers with "offline" stubs; keep the real ones.
 REAL_FETCH_FEEDS = news.fetch_feeds
 REAL_FETCH_HISTORY = news.fetch_announcement_history
+REAL_FETCH_ARCHIVE = news.fetch_press_archive
 
 
 ANNOUNCEMENTS_HTML = """
@@ -101,9 +106,28 @@ def test_total_is_read_from_the_pager():
     ("SYS | Systems Limited Auditors Certificate", "report", False),
     ("Newspaper Advertisement regarding Withholding of Tax on Dividend", "notice", False),
     ("Additional Information of The Hub Power Company Limited", "material_information", False),
+    ("Unusual movement in the price of the Shares of Ghandhara Industries Limited",
+     "notice", False),
+    ("UNUSAL MOVEMENT IN PRICE OF THE SHARES OF PAKISTAN REFINERY LIMITED (PRL)",
+     "notice", False),
 ])
 def test_announcement_classification(title, category, informative):
     assert classify_announcement(title) == (category, informative)
+
+
+def test_stored_announcements_are_classified_again():
+    stored = parse_announcements(ANNOUNCEMENTS_HTML)
+    stored["category"], stored["informative"] = "other", True  # an older rule
+    headline = articles(("Unusual movement claims", "")).assign(category=None)
+    updated = reclassify_announcements(combine_news([stored, headline]))
+
+    by_title = updated.set_index("title")
+    assert by_title.loc["Dissemination of Video Recording of Corporate Briefing Session",
+                        "category"] == "general_meeting"
+    assert not by_title.loc["Dissemination of Video Recording of Corporate Briefing Session",
+                            "informative"]
+    # Press headlines are left alone.
+    assert by_title.loc["Unusual movement claims", "informative"]
 
 
 def test_history_pages_until_total(monkeypatch):
@@ -221,7 +245,8 @@ def test_one_failing_feed_does_not_stop_the_others(monkeypatch):
     ("HUBC", "The Hub Power Company Limited",
      {"Hub Power Company", "Hub Power", "HUBCO"}),
     ("OGDC", "Oil & Gas Development Company Limited",
-     {"Oil & Gas Development Company", "Oil and Gas Development Company", "OGDCL"}),
+     {"Oil & Gas Development Company", "Oil and Gas Development Company",
+      "Oil Gas Development Company", "OGDCL"}),
     ("SYS", "Systems Limited", {"Systems Limited"}),
     ("MEBL", None, set()),
 ])
@@ -279,3 +304,125 @@ def test_combine_removes_duplicates_and_sorts_newest_first():
 
     assert combined["title"].tolist() == ["Newer", "New", "Old"]
     assert combine_news([]).columns.tolist() == news.NEWS_COLUMNS
+
+
+# --- press archive (sitemap) ------------------------------------------------
+
+STORY = "https://tribune.com.pk/story/{}/{}"
+
+
+def sitemap(*stories):
+    """A sitemap from (story id, slug, last-modified day) tuples."""
+    urls = "".join(f"<url><loc>{STORY.format(story, slug)}</loc>"
+                   f"<lastmod>{day}</lastmod></url>" for story, slug, day in stories)
+    return ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            f"{urls}</urlset>").encode()
+
+
+@pytest.mark.parametrize("url, headline", [
+    (STORY.format(2585222, "cement-sales-grow-97-to-258m-tonnes"),
+     "Cement sales grow 97 to 258m tonnes"),
+    (STORY.format(1, "ogdc-plans-partnerships"), "Ogdc plans partnerships"),
+    ("https://tribune.com.pk/story/2585222", None),           # no headline
+    (STORY.format(7, "2585222"), None),                        # only a number
+    ("https://tribune.com.pk/about-us", None),                 # not a story
+])
+def test_headline_is_read_from_the_web_address(url, headline):
+    assert headline_from_url(url) == headline
+
+
+def test_sitemap_is_parsed_into_archive_items():
+    items = parse_sitemap(sitemap((3, "psx-gains-500-points", "2026-11-20"),
+                                  (2, "", "2026-11-20"),
+                                  (1, "urea-sales-fall", "not a date")), "Express Tribune")
+
+    assert items["title"].tolist() == ["Psx gains 500 points"]
+    assert items["published_at"].tolist() == [pd.Timestamp("2026-11-20")]
+    assert news.is_archive(items).all()
+    assert items["summary"].isna().all()
+
+
+def test_broken_sitemap_is_an_error():
+    with pytest.raises(ValueError):
+        parse_sitemap(b"<urlset><url>", "Express Tribune")
+
+
+def test_publication_day_is_estimated_from_later_stories():
+    # Story 2 was edited on the 25th, but story 3 (published after it) was
+    # last modified on the 20th, so story 2 was published by the 20th.
+    items = parse_sitemap(sitemap((3, "c", "2026-11-20"), (2, "b", "2026-11-25"),
+                                  (1, "a", "2026-11-19")), "Express Tribune")
+    published = estimate_publication_days(items).set_index("title")["published_at"]
+
+    assert published["B"] == pd.Timestamp("2026-11-20 23:59:59")
+    assert published["C"] == pd.Timestamp("2026-11-20 23:59:59")
+    assert published["A"] == pd.Timestamp("2026-11-19 23:59:59")
+
+
+def test_archive_pages_are_read_until_old_enough(monkeypatch):
+    today = pd.Timestamp.now(tz="Asia/Karachi").tz_localize(None).normalize()
+    day = lambda ago: f"{today - pd.Timedelta(days=ago):%Y-%m-%d}"
+    pages = {1: sitemap((30, "kse-100-gains", day(1)), (29, "cement-sales-up", day(100))),
+             2: sitemap((28, "urea-sales-down", day(300)), (27, "old-story", day(400))),
+             3: sitemap((26, "older-story", day(700)))}
+    requested = []
+
+    class Response:
+        def __init__(self, page):
+            self.content = pages.get(page, b"")
+            self.status_code = 200 if page in pages else 404
+
+        def raise_for_status(self):
+            if self.status_code != 200:
+                raise requests.HTTPError(self.status_code)
+
+    class Session:
+        def get(self, url, timeout):
+            page = int(url.rsplit("-", 1)[1].split(".")[0])
+            requested.append(page)
+            return Response(page)
+
+    monkeypatch.setattr(news, "_session", Session)
+    items = REAL_FETCH_ARCHIVE(365)
+
+    assert requested == [1, 2]                     # page 2 reaches a year back
+    assert items["title"].tolist() == ["Kse 100 gains", "Cement sales up", "Urea sales down"]
+
+    requested.clear()
+    assert len(REAL_FETCH_ARCHIVE(None)) == 5      # every page, then 404
+    assert requested == [1, 2, 3, 4]
+
+
+def archive_items(*titles):
+    return articles(*[(title, None) for title in titles]).assign(
+        article_id=[f"archive-{i}" for i in range(len(titles))])
+
+
+def test_archive_headlines_match_tickers_in_any_case():
+    items = archive_items("Ogdc plans partnerships in libya",
+                          "Investors try their luck",
+                          "Oil gas development company posts profit")
+    assert match_articles(items, "OGDC", "Oil & Gas Development Company Limited",
+                          None)["title"].tolist() == [
+        "Ogdc plans partnerships in libya", "Oil gas development company posts profit"]
+    # LUCK is also a word, so it still needs capitals.
+    assert match_articles(items, "LUCK", "Lucky Cement Limited", None).empty
+
+
+def test_archive_sector_headlines_need_a_business_term():
+    items = archive_items("Bethell looks to cement place as england number three",
+                          "Cement sales grow 97 to 258m tonnes")
+    tagged = match_articles(items, "FCCL", "Fauji Cement Company Limited", "CEMENT")
+    assert tagged["title"].tolist() == ["Cement sales grow 97 to 258m tonnes"]
+
+
+def test_feed_version_of_a_story_is_preferred_to_the_archive():
+    url = STORY.format(5, "psx-rises-1068-points")
+    feed = articles(("PSX rises 1,068 points in oil-driven rally", "")).assign(url=url)
+    archive = archive_items("Psx rises 1068 points").assign(
+        url=url, published_at=pd.Timestamp("2026-11-24 23:59:59"))
+
+    for frames in ([feed, archive], [archive, feed]):
+        combined = combine_news(frames)
+        assert combined["title"].tolist() == ["PSX rises 1,068 points in oil-driven rally"]
