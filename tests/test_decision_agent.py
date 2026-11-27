@@ -115,13 +115,15 @@ def test_conflicting_agents_give_a_hold_with_low_confidence(agent):
     decision = agent.combine(technical(BUY, 65, 0.40), fundamental(SELL, 60, -0.35),
                              sentiment(HOLD, 20, 0.05))
 
-    # BUY and SELL cancel out: score +0.018 -> HOLD, supported only by
-    # Sentiment (0.25 x 20 = 5%).
+    # BUY and SELL cancel out: score +0.018 -> HOLD. Sentiment supports it
+    # (0.25 x 20 = 5); BUY and SELL are each one step from HOLD, so they
+    # count half: 0.5 x (0.35 x 65 + 0.40 x 60) = 23.4. Total 28.4%.
     assert decision.signal == HOLD
-    assert decision.confidence == pytest.approx(5.0)
+    assert decision.confidence == pytest.approx(28.4)
     assert decision.agreement == "conflict"
     relations = by_agent(decision)["relation"]
-    assert relations.to_dict() == {"technical": "neutral", "fundamental": "neutral",
+    assert relations.to_dict() == {"technical": "partly supports",
+                                   "fundamental": "partly supports",
                                    "sentiment": "supports"}
     assert any("conflict" in w and "Technical Analysis says BUY" in w
                and "Fundamental Analysis says SELL" in w for w in decision.warnings)
@@ -135,9 +137,11 @@ def test_an_opposing_agent_lowers_confidence(agent):
                             sentiment(SELL, 30, -0.30))
 
     assert agreeing.signal == opposed.signal == BUY
-    # A HOLD neither supports nor opposes; a SELL subtracts 0.25 x 30 = 7.5.
-    assert agreeing.confidence == pytest.approx(42.75, abs=0.05)
-    assert opposed.confidence == pytest.approx(35.25, abs=0.05)
+    # Technical + Fundamental support: 22.75 + 20 = 42.75. A HOLD is one
+    # step away and adds half of 0.25 x 30; a SELL subtracts all of it.
+    assert agreeing.confidence == pytest.approx(42.75 + 3.75, abs=0.05)
+    assert opposed.confidence == pytest.approx(42.75 - 7.5, abs=0.05)
+    assert by_agent(agreeing).at["sentiment", "relation"] == "partly supports"
     assert by_agent(opposed).at["sentiment", "relation"] == "opposes"
     assert opposed.agreement == "conflict"
 
@@ -161,18 +165,66 @@ def test_all_agents_saying_hold_supports_a_hold(agent):
     assert decision.agreement == "agree"
 
 
+def test_hold_between_two_buys_is_partly_supported(agent):
+    # GHNI on 2026-11-27, before Agent 4 stopped using market news: two BUYs
+    # and a SELL average to +0.195, just inside the HOLD zone. No agent says
+    # HOLD, but all three are one step from it.
+    decision = agent.combine(technical(BUY, 36, 0.22), fundamental(BUY, 58, 0.41),
+                             sentiment(SELL, 26, -0.62))
+
+    assert decision.signal == HOLD
+    assert decision.score == pytest.approx(0.195, abs=0.001)
+    assert decision.confidence == pytest.approx(0.5 * (12.6 + 23.2 + 6.5), abs=0.1)
+    assert by_agent(decision)["relation"].eq("partly supports").all()
+    assert "Partly supports: Technical Analysis, Fundamental Analysis, Sentiment Analysis." \
+        in decision.summary
+
+
+def test_no_cliff_at_the_buy_threshold(agent):
+    # Score = 0.21 x technical score / 0.45: +0.196 and +0.205, just below
+    # and just above +0.2. HOLD and BUY, both partly confident.
+    below = agent.combine(technical(BUY, 60, 0.42), fundamental(HOLD, 60, 0.0))
+    above = agent.combine(technical(BUY, 60, 0.44), fundamental(HOLD, 60, 0.0))
+
+    assert (below.signal, above.signal) == (HOLD, BUY)
+    # HOLD: 24 (Fundamental) + 0.5 x 21 (Technical); BUY: 21 + 0.5 x 24.
+    assert below.confidence == pytest.approx(34.5)
+    assert above.confidence == pytest.approx(33.0)
+
+
+def test_hold_agent_partly_supports_a_buy(agent):
+    decision = agent.combine(technical(BUY, 60, 0.5), fundamental(HOLD, 60, 0.0),
+                             sentiment(BUY, 40, 0.4))
+
+    assert decision.signal == BUY
+    # 0.35 x 60 + 0.25 x 40 support; 0.40 x 60 counts half.
+    assert decision.confidence == pytest.approx(21 + 10 + 12)
+    assert decision.agreement == "mixed"
+
+
+def test_partial_support_must_stay_between_zero_and_one(monkeypatch):
+    monkeypatch.setattr(config, "DECISION_PARTIAL_SUPPORT", 1.5)
+    with pytest.raises(ValueError):
+        DecisionMakingAgent()
+
+
 def test_confidence_is_never_above_the_agents_weighted_confidence(agent):
-    # Conservative: for every combination, the decision is never more
-    # confident than the weighted average of all three agents (missing
-    # agents count as 0), and never above the most confident agent.
+    # Conservative: for every combination, including missing agents, the
+    # decision is never more confident than the weighted confidence of the
+    # agents that are there (missing ones count as 0), and never above the
+    # most confident agent.
     signals = [(BUY, 0.5), (HOLD, 0.0), (SELL, -0.5)]
-    for (t, ts), (f, fs), (s, ss) in itertools.product(signals, repeat=3):
-        for tc, fc, sc in itertools.product([0, 30, 90], repeat=3):
-            decision = agent.combine(technical(t, tc, ts), fundamental(f, fc, fs),
-                                     sentiment(s, sc, ss))
-            average = 0.35 * tc + 0.40 * fc + 0.25 * sc
-            assert 0 <= decision.confidence <= average + 0.05
-            assert decision.confidence <= max(tc, fc, sc)
+    builders = (technical, fundamental, sentiment)
+    weights = (0.35, 0.40, 0.25)
+    options = [(signal, confidence, score) for signal, score in signals
+               for confidence in (0, 30, 90)] + [None]
+    for chosen in itertools.product(options, repeat=3):
+        results = [None if c is None else build(*c) for build, c in zip(builders, chosen)]
+        confidences = [0 if c is None else c[1] for c in chosen]
+        decision = agent.combine(*results, ticker="TEST")
+        ceiling = sum(w * c for w, c in zip(weights, confidences))
+        assert 0 <= decision.confidence <= ceiling + 0.05
+        assert decision.confidence <= max(confidences)
 
 
 # --- missing agents and failures ------------------------------------------------
@@ -202,6 +254,19 @@ def test_zero_confidence_agent_is_treated_like_a_missing_one(agent):
         missing.signal, missing.score, missing.confidence)
     assert by_agent(empty).at["sentiment", "status"] == "no evidence"
     assert empty.agreement == "agree"
+
+
+def test_conflict_with_a_missing_agent(agent):
+    # SYS on 2026-11-27: technicals SELL, fundamentals BUY, no sentiment.
+    decision = agent.combine(technical(SELL, 54, -0.34), fundamental(BUY, 55, 0.24), None)
+
+    assert decision.signal == HOLD
+    assert decision.agreement == "conflict"
+    # Both are one step from HOLD; the missing 25% adds nothing.
+    assert decision.confidence == pytest.approx(0.5 * (0.35 * 54 + 0.40 * 55), abs=0.1)
+    assert decision.confidence <= 75
+    assert any("at most 75%" in w for w in decision.warnings)
+    assert any("conflict" in w for w in decision.warnings)
 
 
 def test_only_one_agent_left(agent):

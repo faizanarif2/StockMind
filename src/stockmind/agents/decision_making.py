@@ -27,20 +27,22 @@ How the decision is made
        score >= +T  -> BUY      score <= -T  -> SELL     otherwise HOLD
    with T = config.DECISION_SIGNAL_THRESHOLD, the same rule as Agents 2-4.
 
-4. Confidence (0-100), deliberately conservative:
-       confidence = 100 x (supporting - opposing) / total base weight
-   supporting  sum of the effective weights of agents whose signal is the
-               same as the decision
-   opposing    the same for agents pointing the opposite way (BUY against
-               SELL). An agent saying HOLD against a BUY or SELL decision,
-               or BUY / SELL against a HOLD decision, neither supports nor
-               opposes it.
+4. Confidence (0-100), deliberately conservative. HOLD lies between BUY
+   and SELL, so each agent's effective weight counts by how far its signal
+   is from the decision:
+       same signal       x 1     supports
+       one step away     x P     partly supports (HOLD for a BUY or SELL
+                                 decision; BUY or SELL for a HOLD decision)
+       opposite signal   x -1    opposes (BUY against SELL)
+       confidence = 100 x (sum of those) / total base weight
+   with P = config.DECISION_PARTIAL_SUPPORT (0.5). A decision just inside
+   the HOLD zone between two BUYs is therefore partly supported, not 0%.
    The total base weight includes missing agents. Unlike the score (step
    3), confidence is NOT rescaled when an agent is missing: an agent with
    no result counts as no support, so a missing 25% agent caps confidence
-   at 75%. The decision is therefore never more confident than the
-   weighted average of the agents behind it, conflicts lower it, and a
-   confidence below 0 becomes 0.
+   at 75%. No agent counts more than its own effective weight, so the
+   decision is never more confident than the weighted confidence of the
+   agents that are there; conflicts lower it, and below 0 it becomes 0.
 
    Decision score (0-100) = 50 x (score + 1), like the agents' technical,
    health and sentiment scores. It shows the DIRECTION of the combined view
@@ -126,7 +128,11 @@ def relation(agent_signal: str, decision: str) -> str:
         return "supports"
     if {agent_signal, decision} == {BUY, SELL}:
         return "opposes"
-    return "neutral"
+    return "partly supports"
+
+
+# How much of an agent's effective weight counts towards the confidence.
+SUPPORT = {"supports": 1.0, "opposes": -1.0}
 
 
 def strongest_reason(result: AnalysisResult) -> str | None:
@@ -159,6 +165,9 @@ class DecisionMakingAgent:
         sentiment: SentimentAnalysisAgent | None = None,
     ) -> None:
         self.weights = normalise_weights(weights or config.DECISION_AGENT_WEIGHTS)
+        if not 0 <= config.DECISION_PARTIAL_SUPPORT <= 1:
+            # Above 1 an agent could add more than its own confidence.
+            raise ValueError("config.DECISION_PARTIAL_SUPPORT must be between 0 and 1")
         self._agents = {
             "technical": technical or TechnicalAnalysisAgent(),
             "fundamental": fundamental or FundamentalAnalysisAgent(),
@@ -221,8 +230,9 @@ class DecisionMakingAgent:
             signal = vote(score, config.DECISION_SIGNAL_THRESHOLD)
             table.loc[used.index, "share"] = (used["effective_weight"] / used_weight).round(3)
             table.loc[used.index, "relation"] = [relation(s, signal) for s in used["signal"]]
-            weight_by = table.groupby("relation")["effective_weight"].sum()
-            net = weight_by.get("supports", 0.0) - weight_by.get("opposes", 0.0)
+            factor = table.loc[used.index, "relation"].map(
+                lambda r: SUPPORT.get(r, config.DECISION_PARTIAL_SUPPORT))
+            net = float((factor * used["effective_weight"]).sum())
             # sum(self.weights) is 1, so this is the share of ALL the weight,
             # missing agents included (see the module docstring).
             confidence = round(100 * max(0.0, net) / sum(self.weights.values()), 1)
@@ -287,7 +297,7 @@ class DecisionMakingAgent:
             return f"{said}; its weight is 0, so it is not used."
         effect = {"supports": f"supports the {decision}",
                   "opposes": f"goes against the {decision}",
-                  "neutral": f"does not support the {decision}"}[row.relation]
+                  "partly supports": f"partly supports the {decision}"}[row.relation]
         sentence = f"{said}; {effect} ({row.share:.0%} of the decision)."
         if isinstance(row.reason, str) and row.reason:  # missing is NaN in a table
             sentence += f" Strongest point: {row.reason}"
@@ -348,8 +358,9 @@ class DecisionMakingAgent:
         elif decision.agreement != "agree":
             if decision.agreement == "conflict":
                 parts.append("The agents conflict.")
-            for word, relation_ in (("Supports", "supports"), ("Against", "opposes"),
-                                    ("Does not support", "neutral")):
+            for word, relation_ in (("Supports", "supports"),
+                                    ("Partly supports", "partly supports"),
+                                    ("Against", "opposes")):
                 if names(relation_):
                     parts.append(f"{word}: {names(relation_)}.")
         unused = table.loc[table["status"].isin(["missing", "no evidence"]),

@@ -541,3 +541,8 @@ DECISION_AGENT_WEIGHTS: dict[str, float] = {
 # Same rule as Agents 2-4: combined score >= +threshold -> BUY,
 # <= -threshold -> SELL, otherwise HOLD.
 DECISION_SIGNAL_THRESHOLD = 0.2
+
+# HOLD lies between BUY and SELL. An agent one step away from the decision
+# (HOLD for a BUY or SELL decision, BUY or SELL for a HOLD decision) counts
+# this share of its confidence as support. BUY against SELL counts against.
+DECISION_PARTIAL_SUPPORT = 0.5

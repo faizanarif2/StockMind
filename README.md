@@ -469,7 +469,7 @@ result.history            # monthly sentiment for company, sector and market new
 PAEL: BUY (13% confidence, decision score 60/100, agents conflict)
   - Technical Analysis: SELL with 43% confidence (score -0.31, weight 35%); goes against the BUY (35% of the decision). Strongest point: The 50-day SMA (PKR 34.26) is 13.7% below the 200-day SMA (PKR 39.69): long-term downtrend (bearish).
   - Fundamental Analysis: BUY with 70% confidence (score +0.48, weight 40%); supports the BUY (64% of the decision). Strongest point: P/E ratio is 7.47x, below the sector median of 15.48x (better); strong on its own.
-  - Sentiment Analysis: HOLD with 2% confidence (score +0.00, weight 25%); does not support the BUY (1% of the decision).
+  - Sentiment Analysis: HOLD with 2% confidence (score +0.00, weight 25%); partly supports the BUY (1% of the decision).
   WARNING: PAEL: the agents conflict: Fundamental Analysis says BUY, Technical Analysis says SELL; the decision is less certain.
 ```
 
@@ -478,9 +478,17 @@ PAEL: BUY (13% confidence, decision score 60/100, agents conflict)
 1. **Base weights**: technical 0.35, fundamental 0.40, sentiment 0.25. Fundamentals come from audited statements and suit a weeks-to-months view, technicals react to the price now, and PSX news is sparse and late, so sentiment counts least. They are rescaled to add up to 1.
 2. **Each weight is scaled by the agent's own confidence**: effective weight = base weight x confidence / 100. An agent that is 15% sure barely moves the decision.
 3. **Decision score** = average of the agents' scores (-1 to +1), weighted by effective weight. Score >= +0.2 is BUY, <= -0.2 is SELL, anything in between is HOLD, the same rule as Agents 2-4.
-4. **Confidence** = 100 x (effective weight of the agents that agree with the decision - effective weight of those pointing the opposite way, BUY against SELL), divided by the total base weight. An agent saying HOLD against a BUY, or BUY against a HOLD, adds nothing either way. Below 0 counts as 0.
+4. **Confidence**: HOLD lies between BUY and SELL, so each agent's effective weight counts by how far its signal is from the decision, and the total is divided by the total base weight. Below 0 counts as 0.
 
-**Conservative by design.** The decision is never more confident than the weighted average of the agents' confidences: three agents that agree at 65%, 50% and 29% give 50%, not more. Conflicts lower it. In the example, a 70%-confident fundamental BUY ends at 13%, because technicals point the other way and sentiment has almost no evidence.
+| Agent's signal vs the decision | Counts | Example |
+|---|---|---|
+| Same | x 1 (supports) | BUY for a BUY |
+| One step away | x 0.5 (partly supports, `DECISION_PARTIAL_SUPPORT`) | HOLD for a BUY, BUY or SELL for a HOLD |
+| Opposite | x -1 (opposes) | SELL for a BUY |
+
+Partial support removes a cliff at the BUY / SELL thresholds. Two BUYs and a weak SELL that average +0.195, just inside the HOLD zone, used to give HOLD with 0% confidence, because no agent said HOLD. Now it gives HOLD at 21%, and a score of +0.205 gives a BUY of similar confidence.
+
+**Conservative by design.** No agent counts more than its own effective weight, so the decision is never more confident than the weighted confidence of the agents behind it: three agents that agree at 65%, 50% and 29% give 50%, not more. Conflicts lower it. In the example, a 70%-confident fundamental BUY ends at 13%, because technicals point the other way and sentiment has almost no evidence.
 
 **Missing agents.** An agent that fails, has no result, or has 0% confidence (no prices, no statements, no news) is treated as giving no evidence. The two parts of the decision handle this differently:
 
