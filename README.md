@@ -310,7 +310,8 @@ StockMind/
 │       ├── config.py              # supported tickers, cache settings
 │       ├── agents/
 │       │   ├── data_collection.py # Agent 1
-│       │   └── fundamental_analysis.py # Agent 3
+│       │   ├── fundamental_analysis.py # Agent 3
+│       │   └── decision_making.py # Agent 5
 │       ├── analysis/
 │       │   └── ratios.py          # P/E, ROE, growth, margins from statements
 │       └── data/
@@ -324,6 +325,7 @@ StockMind/
 ├── scripts/
 │   ├── collect_data.py            # run Agent 1 and print a summary
 │   ├── analyse_fundamentals.py    # run Agents 1 + 3 and print the signal
+│   ├── decide.py                  # run Agents 1-5 and print the final decision
 │   └── kmi30_weights.py           # current KMI-30 ranking
 ├── tests/
 ├── .gitignore
@@ -378,6 +380,7 @@ python scripts/collect_data.py OGDC     # one company
 python scripts/collect_data.py --force  # ignore the cache, fetch live
 python scripts/analyse_fundamentals.py       # fundamental signal, all companies
 python scripts/analyse_fundamentals.py MEBL  # one company
+python scripts/decide.py                     # final decision (Agent 5)
 python -m pytest
 ```
 
@@ -456,6 +459,60 @@ result.history            # monthly sentiment for company, sector and market new
 
 **Limitations.** Company-specific press headlines are rare, so the company signals rest mostly on PSX announcements, whose titles are short and often neutral. Many companies file only procedural titles for months (e.g. HUBC: "Financial Result for the First Quarter...", "Credit of Interim Cash Dividend"), whose content is in the PDF, so their company signals are often empty and their confidence low. FinBERT also reads plain statements of fact as neutral ("GAS/CONDENSATE DISCOVERY AT BITRISIM NORTHWEST-1..." scored +0.06), because Financial PhraseBank's annotators labelled facts neutral unless they were clearly good or bad. Low confidence is the intended result in these cases: the Decision Agent weighs each agent by its confidence. The press archive fills the market signal from the first run, but sector headlines are few (often none in a 30-day window), and a company with no informative news of its own gets a result from market news alone, at low confidence (e.g. HUBC: BUY, 15%). FinBERT reads one headline at a time and does not know which company a market report is mainly about.
 
+## Agent 5 - Decision Making Agent (implemented)
+
+`src/stockmind/agents/decision_making.py` combines the signals of Agents 2, 3 and 4 into one final Buy / Hold / Sell decision with a confidence and an explanation. It only combines their results, so it adds no time of its own:
+
+```text
+HUBC: BUY (32% confidence, decision score 70/100, agents conflict)
+  - Technical Analysis: HOLD with 36% confidence (score +0.09, weight 35%); does not support the BUY (23% of the decision).
+  - Fundamental Analysis: BUY with 92% confidence (score +0.61, weight 40%); supports the BUY (68% of the decision). Strongest point: Return on equity is 20.5%, above the sector median of 8.2% (better); strong on its own.
+  - Sentiment Analysis: SELL with 18% confidence (score -0.50, weight 25%); goes against the BUY (8% of the decision). ...
+  WARNING: HUBC: the agents conflict: Fundamental Analysis says BUY, Sentiment Analysis says SELL; the decision is less certain.
+```
+
+**How the decision is made** (settings in `config.DECISION_*`):
+
+1. **Base weights**: technical 0.35, fundamental 0.40, sentiment 0.25. Fundamentals come from audited statements and suit a weeks-to-months view, technicals react to the price now, and PSX news is sparse and late, so sentiment counts least. They are rescaled to add up to 1.
+2. **Each weight is scaled by the agent's own confidence**: effective weight = base weight x confidence / 100. An agent that is 15% sure barely moves the decision.
+3. **Decision score** = average of the agents' scores (-1 to +1), weighted by effective weight. Score >= +0.2 is BUY, <= -0.2 is SELL, anything in between is HOLD, the same rule as Agents 2-4.
+4. **Confidence** = 100 x (effective weight of the agents that agree with the decision - effective weight of those pointing the opposite way, BUY against SELL), divided by the total base weight. An agent saying HOLD against a BUY, or BUY against a HOLD, adds nothing either way. Below 0 counts as 0.
+
+**Conservative by design.** The decision is never more confident than the weighted average of the agents' confidences: three agents that agree at 65%, 50% and 29% give 50%, not more. Conflicts lower it. In the example, a 92%-confident fundamental BUY ends at 32%, because technicals do not support it and sentiment points the other way.
+
+**Missing agents.** An agent that fails, has no result, or has 0% confidence (no prices, no statements, no news) is treated as giving no evidence. The two parts of the decision handle this differently:
+
+- The **score** is averaged only over the agents with evidence, so a missing agent does not pull it towards HOLD.
+- The **confidence** is *not* rescaled: the missing agent's weight still counts in the total, as no support. Without sentiment (25%), confidence can be at most 75%, and a warning says so.
+
+If every agent fails, the decision is HOLD with 0% confidence. One agent crashing never stops the others: the error becomes a warning.
+
+**Decision score vs confidence.** The decision score (0-100) = 50 x (score + 1), like the agents' technical, health and sentiment scores. It shows the **direction** of the combined view: 0 is strongly bearish, 50 neutral, 100 strongly bullish, with BUY from 60 and SELL from 40. The confidence shows **how much to trust it**. The two are separate: a single unsure agent can give a decision score of 90 with 7% confidence.
+
+```powershell
+python scripts/decide.py              # the Stage 0 selection
+python scripts/decide.py OGDC         # one company
+```
+
+```python
+from stockmind.agents.data_collection import DataCollectionAgent
+from stockmind.agents.decision_making import DecisionMakingAgent
+
+decision = DecisionMakingAgent().decide(DataCollectionAgent().collect("OGDC"))
+decision.signal          # "BUY", "HOLD" or "SELL"
+decision.confidence      # 0-100: how much to trust it
+decision.decision_score  # 0-100: how bullish the combined view is
+decision.agreement       # "agree", "mixed", "conflict" or "none"
+decision.contributions   # one row per agent: signal, confidence, weight, share, relation, reason
+decision.explanation     # one sentence per agent
+decision.technical, decision.fundamental, decision.sentiment   # the agents' full results
+
+# Results already calculated (e.g. in a backtest) can be combined directly:
+DecisionMakingAgent().combine(technical_result, fundamental_result, sentiment_result)
+```
+
+**For Agent 7 (Learning).** The base weights are the part to learn. Agent 7 can pass its own without changing Agent 5: `DecisionMakingAgent(weights={"technical": ..., "fundamental": ..., "sentiment": ...})`. `decision.weights` records which weights were used.
+
 ## Data Quality Principles
 
 Price history is validated for issues such as:
@@ -472,9 +529,9 @@ Unusual values will not automatically be treated as errors because genuine marke
 
 - Done: Agent 1 (prices, profile, financial statements, ratios, dividends) with on-demand fetching, caching, and automated tests.
 - Done: Agent 3 (fundamental ratios, sector comparison, Buy/Hold/Sell signal with confidence and explanation) with automated tests.
-- In progress: Technical Analysis Agent (Agent 2).
-- Next: Decision Agent v1 (combines Agents 2 and 3) and the basic web application.
-- Later: news collection, Sentiment, Risk, and Learning agents.
+- Done: Agent 2 (technical indicators), Agent 4 (news sentiment with FinBERT) and Agent 5 (final decision combining Agents 2-4), each with automated tests.
+- Next: the basic web application.
+- Later: Risk and Learning (Agent 7) agents.
 
 ## Known Data Limitations
 

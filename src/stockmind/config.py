@@ -514,3 +514,24 @@ MIN_PEERS_FOR_COMPARISON = 2
 # Peers whose latest statements end this long before the company's own are
 # left out of the comparison (e.g. a peer that stopped filing).
 PEER_MAX_STATEMENT_LAG = timedelta(days=548)  # about 18 months
+
+
+# ---------------------------------------------------------------------------
+# Decision Making Agent (Agent 5)
+# ---------------------------------------------------------------------------
+# How much each analysis agent's view counts in the final decision, before
+# it is scaled by that agent's own confidence. They are rescaled to add up
+# to 1. Fundamentals come from audited statements and suit a weeks-to-
+# months view; technicals react to the price now; news on PSX companies is
+# sparse and the press reports late, so sentiment counts least. Agent 7
+# (Learning) will later replace these with weights learnt from backtests,
+# by passing its own to DecisionMakingAgent(weights=...).
+DECISION_AGENT_WEIGHTS: dict[str, float] = {
+    "technical": 0.35,
+    "fundamental": 0.40,
+    "sentiment": 0.25,
+}
+
+# Same rule as Agents 2-4: combined score >= +threshold -> BUY,
+# <= -threshold -> SELL, otherwise HOLD.
+DECISION_SIGNAL_THRESHOLD = 0.2
