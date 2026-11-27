@@ -349,11 +349,17 @@ SENTIMENT_MAX_TOKENS = 64   # headlines are short; longer text is cut
 #   company_long_term  the tone of the company's news over the last year
 #   sector             headlines about its industry, e.g. urea prices
 #   market             headlines about the PSX as a whole
+# A weight of 0 makes a signal context only: it is still calculated and
+# explained, but never moves the company's score, signal or confidence.
+# Market news is context only because it is the same for every company, so
+# it cannot tell one stock from another: a single bad session reported by
+# four papers turned every company's sentiment into SELL. Market-wide falls
+# are a matter for risk analysis (Agent 6), not for a company's sentiment.
 SENTIMENT_SIGNALS: dict[str, tuple[float, str, int, float]] = {
     "company_recent":    (0.45, "company", 60, 14),
     "company_long_term": (0.15, "company", 365, 120),
     "sector":            (0.20, "sector", 30, 7),
-    "market":            (0.20, "market", 14, 3),
+    "market":            (0.0, "market", 14, 3),     # context only
 }
 
 # An average sentiment of +/- this much scores +/-1. Most financial

@@ -26,7 +26,7 @@ How the signal is made
      company_recent     the company's own news, last 60 days
      company_long_term  the company's news over the last year
      sector             industry headlines, last 30 days
-     market             PSX market headlines, last 14 days
+     market             PSX market headlines, last 14 days (context only)
    A signal's value is the recency-weighted average sentiment of its items
    (an item's weight halves every half-life, so recent news counts most, as
    the proposal plans). Its score is that average / config.SENTIMENT_SCALE,
@@ -34,8 +34,14 @@ How the signal is made
    / config.SENTIMENT_FULL_EVIDENCE: one fresh headline counts only partly.
    A signal with no items in its window is skipped.
 
-4. Overall score = average of the signal scores, weighted by weight x
-   evidence.
+   Market news is context only (weight 0): it is the same for every
+   company, so it cannot tell one stock from another. It is still scored,
+   explained and summarised as the market mood, but it never moves the
+   company's score, signal or confidence. Market-wide falls are left to
+   risk analysis (Agent 6).
+
+4. Overall score = average of the company and sector signal scores,
+   weighted by weight x evidence.
        score >= +T  -> BUY      score <= -T  -> SELL     otherwise HOLD
    with T = config.SENTIMENT_SIGNAL_THRESHOLD. The sentiment label is
    positive / neutral / negative accordingly.
@@ -44,6 +50,10 @@ How the signal is made
        confidence = 100 x coverage x (agreement + strength) / 2
    coverage is the share of the weight backed by evidence, so little or no
    news means low confidence (not a confident HOLD).
+
+   With no company or sector news at all there is not enough evidence: the
+   result is HOLD with 0% confidence and sentiment "unknown", whatever the
+   market news says. Agent 5 treats that as no evidence from Agent 4.
 
    Sentiment score (0-100) = 50 x (score + 1), for display.
 
@@ -84,6 +94,7 @@ HISTORY_COLUMNS = ["month", "relevance", "items", "positive", "negative",
 
 SENTIMENT_LABEL = {BUY: "positive", SELL: "negative", HOLD: "neutral"}
 DIRECTION = {BUY: "positive", SELL: "negative", HOLD: "neutral"}
+UNKNOWN = "unknown"  # sentiment when there is not enough company or sector news
 
 
 @dataclass
@@ -95,7 +106,7 @@ class SentimentAnalysis:
     confidence: float           # 0-100
     score: float                # -1 (negative) to +1 (positive)
     sentiment_score: float      # 0-100
-    sentiment: str              # "positive", "neutral" or "negative"
+    sentiment: str              # "positive", "neutral", "negative" or "unknown"
     period: str | None          # news used, e.g. "news to 2026-11-24"
     signals: pd.DataFrame       # one row per signal, see SIGNAL_COLUMNS
     articles: pd.DataFrame      # every scored news item (news + SCORE_COLUMNS)
@@ -168,6 +179,9 @@ class SentimentAnalysisAgent:
             config.SENTIMENT_SIGNAL_THRESHOLD, config.SENTIMENT_FULL_STRENGTH)
         if coverage == 0:
             signal, confidence = HOLD, 0.0
+            warnings.append(f"{data.ticker}: no informative company or sector news, "
+                            "so there is not enough evidence for a sentiment signal "
+                            "(market news is context only).")
 
         latest = articles["published_at"].max()
         result = SentimentAnalysis(
@@ -176,7 +190,7 @@ class SentimentAnalysisAgent:
             confidence=confidence,
             score=round(score, 3),
             sentiment_score=round(50 * (score + 1), 1),
-            sentiment=SENTIMENT_LABEL[signal],
+            sentiment=SENTIMENT_LABEL[signal] if coverage > 0 else UNKNOWN,
             period=f"news to {latest:%Y-%m-%d}",
             signals=signals,
             articles=articles,
@@ -220,6 +234,9 @@ class SentimentAnalysisAgent:
                 "vote": vote(score, config.SENTIMENT_SIGNAL_THRESHOLD),
             })
             row["comment"] = SentimentAnalysisAgent._describe(row, window, group, weights)
+            if weight == 0:
+                row["comment"] += (" Context only: the same for every company, so "
+                                   "not part of this company's signal.")
             rows.append(row)
         return pd.DataFrame(rows, columns=SIGNAL_COLUMNS)
 
@@ -314,7 +331,7 @@ class SentimentAnalysisAgent:
     def _no_news(ticker: str, warnings: list[str]) -> SentimentAnalysis:
         result = SentimentAnalysis(
             ticker=ticker, signal=HOLD, confidence=0.0, score=0.0,
-            sentiment_score=50.0, sentiment="neutral", period=None,
+            sentiment_score=50.0, sentiment=UNKNOWN, period=None,
             signals=pd.DataFrame(columns=SIGNAL_COLUMNS),
             articles=pd.DataFrame(columns=[*NEWS_COLUMNS, *SCORE_COLUMNS]),
             history=pd.DataFrame(columns=HISTORY_COLUMNS),
@@ -325,13 +342,23 @@ class SentimentAnalysisAgent:
 
     @staticmethod
     def _summarise(result: SentimentAnalysis, coverage: float) -> str:
-        if coverage == 0:
-            return (f"{result.ticker}: not enough news for a sentiment "
-                    "assessment. Signal HOLD with 0% confidence.")
-
         scored = result.signals[result.signals["score"].notna()]
-        positive = scored.loc[scored["vote"] == BUY, "label"].tolist()
-        negative = scored.loc[scored["vote"] == SELL, "label"].tolist()
+        counted = scored[scored["weight"] > 0]
+        context = scored[scored["weight"] == 0]
+        mood = [f"{row.label} (context only, not part of the signal): "
+                f"{DIRECTION[row.vote]}, {row.value:+.2f}."
+                for row in context.itertuples()]
+        if coverage == 0:
+            if result.signals.empty:
+                reason = "not enough news for a sentiment assessment."
+            else:
+                reason = ("no informative company or sector news, so there is not "
+                          "enough evidence for a sentiment assessment.")
+            return " ".join([f"{result.ticker}: {reason}", *mood,
+                             "Signal HOLD with 0% confidence."])
+
+        positive = counted.loc[counted["vote"] == BUY, "label"].tolist()
+        negative = counted.loc[counted["vote"] == SELL, "label"].tolist()
         parts = [
             f"{result.ticker}'s news sentiment is {result.sentiment} "
             f"(sentiment score {result.sentiment_score:.0f}/100, "
@@ -341,11 +368,12 @@ class SentimentAnalysisAgent:
             parts.append("Positive: " + ", ".join(positive) + ".")
         if negative:
             parts.append("Negative: " + ", ".join(negative) + ".")
-        used = scored[scored["evidence"] > 0]
+        used = counted[counted["evidence"] > 0]
         if not used["signal"].str.startswith("company").any():
             parts.append(f"There is no informative news about {result.ticker} "
                          "itself, so this reflects only "
                          + " and ".join(label.lower() for label in used["label"]) + ".")
+        parts += mood
         parts.append(f"Sentiment signal: {result.signal} with "
                      f"{result.confidence:.0f}% confidence.")
         return " ".join(parts)

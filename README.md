@@ -410,11 +410,13 @@ OGDC: BUY (29% confidence, sentiment score 67/100, positive)
   - Company news (recent): 2 items in the last 60 days (0 positive, 0 negative, 2 neutral); recency-weighted sentiment +0.06 (neutral).
   - Company news (past year): 59 items in the last 365 days (18 positive, 1 negative, 40 neutral); recency-weighted sentiment +0.25 (positive). Most positive: "Ogdc turns to us firm to boost oil output" (2026-09-02).
   - Sector news: no news in the last 30 days.
-  - Market news: 27 items in the last 14 days (14 positive, 10 negative, 3 neutral); recency-weighted sentiment +0.14 (positive).
+  - Market news: 27 items in the last 14 days (14 positive, 10 negative, 3 neutral); recency-weighted sentiment +0.14 (positive). Context only: the same for every company, so not part of this company's signal.
   WARNING: OGDC: no OIL & GAS EXPLORATION COMPANIES sector headlines in the last 30 days.
 ```
 
-**Warnings name the cause** of a missing signal, so it can be fixed when it can be: procedural notices only ("only 14 procedural notices, e.g. board meetings"), a sector with no keywords in `NEWS_SECTOR_KEYWORDS`, or headlines stored for less time than the signal's window. When nothing is known about the company itself, the summary says the result reflects only sector or market news.
+**Warnings name the cause** of a missing signal, so it can be fixed when it can be: procedural notices only ("only 14 procedural notices, e.g. board meetings"), a sector with no keywords in `NEWS_SECTOR_KEYWORDS`, or headlines stored for less time than the signal's window. When nothing is known about the company itself, the summary says the result reflects only sector news.
+
+**Market news is context only.** PSX market headlines (e.g. KSE-100 reports) are still collected, scored, explained and summarised as the market mood, but they never move a company's score, signal or confidence (their weight is 0). They are the same for every company, so they cannot tell one stock from another. On 2026-11-27, a single bad session reported by four papers turned every selected company's sentiment into SELL and made Agent 5 report a conflict for all of them. With no informative company or sector news, the result is **HOLD with 0% confidence and sentiment "unknown"** (not enough evidence), whatever the market news says, and Agent 5 then treats Agent 4 as having no evidence. Market-wide falls, including crashes, are left to risk analysis (Agent 6).
 
 ```powershell
 python scripts/analyse_sentiment.py              # the Stage 0 selection
@@ -428,7 +430,7 @@ from stockmind.agents.sentiment_analysis import SentimentAnalysisAgent
 
 result = SentimentAnalysisAgent().analyse(DataCollectionAgent().collect("OGDC"))
 result.signal, result.confidence, result.score   # same fields as Agents 2 and 3
-result.sentiment          # "positive", "neutral" or "negative"
+result.sentiment          # "positive", "neutral", "negative" or "unknown" (not enough evidence)
 result.signals            # one row per signal: items, value, score, evidence, vote
 result.articles           # every analysed item with P(positive/negative/neutral)
 result.history            # monthly sentiment for company, sector and market news
@@ -443,7 +445,7 @@ result.history            # monthly sentiment for company, sector and market new
 | `company_recent` | The company's announcements and headlines naming it | 60 days | 14 days | 0.45 |
 | `company_long_term` | The same, over the past year | 365 days | 120 days | 0.15 |
 | `sector` | Industry headlines (e.g. urea prices for a fertilizer maker) | 30 days | 7 days | 0.20 |
-| `market` | PSX market headlines (e.g. KSE-100 reports) | 14 days | 3 days | 0.20 |
+| `market` | PSX market headlines (e.g. KSE-100 reports) | 14 days | 3 days | 0 (context only) |
 
 - **Only informative items** are used. A "Notice of Board Meeting" gives FinBERT nothing to read.
 - **Recent news counts more**, as the proposal plans: an item's weight halves every half-life.
@@ -457,18 +459,18 @@ result.history            # monthly sentiment for company, sector and market new
 
 **Preparing the text.** Pakistani newspapers write "53pc" for "53 percent", which FinBERT does not know: "OGDC profit surges 53pc and declares dividend" scored -0.25, and +0.61 with "percent". "pc" after a number is therefore replaced before scoring.
 
-**Limitations.** Company-specific press headlines are rare, so the company signals rest mostly on PSX announcements, whose titles are short and often neutral. Many companies file only procedural titles for months (e.g. HUBC: "Financial Result for the First Quarter...", "Credit of Interim Cash Dividend"), whose content is in the PDF, so their company signals are often empty and their confidence low. FinBERT also reads plain statements of fact as neutral ("GAS/CONDENSATE DISCOVERY AT BITRISIM NORTHWEST-1..." scored +0.06), because Financial PhraseBank's annotators labelled facts neutral unless they were clearly good or bad. Low confidence is the intended result in these cases: the Decision Agent weighs each agent by its confidence. The press archive fills the market signal from the first run, but sector headlines are few (often none in a 30-day window), and a company with no informative news of its own gets a result from market news alone, at low confidence (e.g. HUBC: BUY, 15%). FinBERT reads one headline at a time and does not know which company a market report is mainly about.
+**Limitations.** Company-specific press headlines are rare, so the company signals rest mostly on PSX announcements, whose titles are short and often neutral. Many companies file only procedural titles for months (e.g. HUBC: "Financial Result for the First Quarter...", "Credit of Interim Cash Dividend"), whose content is in the PDF, so their company signals are often empty and their confidence low. FinBERT also reads plain statements of fact as neutral ("GAS/CONDENSATE DISCOVERY AT BITRISIM NORTHWEST-1..." scored +0.06), because Financial PhraseBank's annotators labelled facts neutral unless they were clearly good or bad. Low confidence is the intended result in these cases: the Decision Agent weighs each agent by its confidence. The press archive fills the market context from the first run, but sector headlines are few (often none in a 30-day window), so a company with no informative news of its own often has no sentiment signal at all (HOLD, 0% confidence). FinBERT reads one headline at a time and does not know which company a market report is mainly about.
 
 ## Agent 5 - Decision Making Agent (implemented)
 
 `src/stockmind/agents/decision_making.py` combines the signals of Agents 2, 3 and 4 into one final Buy / Hold / Sell decision with a confidence and an explanation. It only combines their results, so it adds no time of its own:
 
 ```text
-HUBC: BUY (32% confidence, decision score 70/100, agents conflict)
-  - Technical Analysis: HOLD with 36% confidence (score +0.09, weight 35%); does not support the BUY (23% of the decision).
-  - Fundamental Analysis: BUY with 92% confidence (score +0.61, weight 40%); supports the BUY (68% of the decision). Strongest point: Return on equity is 20.5%, above the sector median of 8.2% (better); strong on its own.
-  - Sentiment Analysis: SELL with 18% confidence (score -0.50, weight 25%); goes against the BUY (8% of the decision). ...
-  WARNING: HUBC: the agents conflict: Fundamental Analysis says BUY, Sentiment Analysis says SELL; the decision is less certain.
+PAEL: BUY (13% confidence, decision score 60/100, agents conflict)
+  - Technical Analysis: SELL with 43% confidence (score -0.31, weight 35%); goes against the BUY (35% of the decision). Strongest point: The 50-day SMA (PKR 34.26) is 13.7% below the 200-day SMA (PKR 39.69): long-term downtrend (bearish).
+  - Fundamental Analysis: BUY with 70% confidence (score +0.48, weight 40%); supports the BUY (64% of the decision). Strongest point: P/E ratio is 7.47x, below the sector median of 15.48x (better); strong on its own.
+  - Sentiment Analysis: HOLD with 2% confidence (score +0.00, weight 25%); does not support the BUY (1% of the decision).
+  WARNING: PAEL: the agents conflict: Fundamental Analysis says BUY, Technical Analysis says SELL; the decision is less certain.
 ```
 
 **How the decision is made** (settings in `config.DECISION_*`):
@@ -478,7 +480,7 @@ HUBC: BUY (32% confidence, decision score 70/100, agents conflict)
 3. **Decision score** = average of the agents' scores (-1 to +1), weighted by effective weight. Score >= +0.2 is BUY, <= -0.2 is SELL, anything in between is HOLD, the same rule as Agents 2-4.
 4. **Confidence** = 100 x (effective weight of the agents that agree with the decision - effective weight of those pointing the opposite way, BUY against SELL), divided by the total base weight. An agent saying HOLD against a BUY, or BUY against a HOLD, adds nothing either way. Below 0 counts as 0.
 
-**Conservative by design.** The decision is never more confident than the weighted average of the agents' confidences: three agents that agree at 65%, 50% and 29% give 50%, not more. Conflicts lower it. In the example, a 92%-confident fundamental BUY ends at 32%, because technicals do not support it and sentiment points the other way.
+**Conservative by design.** The decision is never more confident than the weighted average of the agents' confidences: three agents that agree at 65%, 50% and 29% give 50%, not more. Conflicts lower it. In the example, a 70%-confident fundamental BUY ends at 13%, because technicals point the other way and sentiment has almost no evidence.
 
 **Missing agents.** An agent that fails, has no result, or has 0% confidence (no prices, no statements, no news) is treated as giving no evidence. The two parts of the decision handle this differently:
 

@@ -295,8 +295,72 @@ def test_recency_weights_halve_every_half_life():
 
 
 def test_summary_says_when_there_is_no_company_news(agent):
-    result = agent.analyse(company(*[item(f"KSE-100 gains {i}", 1, "market")
+    result = agent.analyse(company(*[item(f"Urea offtake gains {i}", 1, "sector")
                                      for i in range(4)]), as_of=NOW)
 
+    assert result.signal == BUY
     assert ("There is no informative news about OGDC itself, so this reflects "
-            "only market news.") in result.summary
+            "only sector news.") in result.summary
+
+
+# --- market news is context only ----------------------------------------------
+
+def market(title, copies=4, days_ago=0):
+    return [item(f"{title} {i}", days_ago, "market") for i in range(copies)]
+
+
+def test_market_news_alone_is_not_enough_evidence(agent):
+    result = agent.analyse(company(*market("KSE-100 sheds 1,000 points")), as_of=NOW)
+
+    assert (result.signal, result.confidence, result.score) == (HOLD, 0.0, 0.0)
+    assert (result.sentiment, result.sentiment_score) == ("unknown", 50.0)
+    assert ("OGDC: no informative company or sector news, so there is not enough "
+            "evidence for a sentiment signal (market news is context only).") in result.warnings
+    # The market news is still scored and explained.
+    row = result.signals.set_index("signal").loc["market"]
+    assert (row["items"], row["vote"], row["weight"]) == (4, SELL, 0.0)
+    assert "Context only" in row["comment"]
+    assert "Market news (context only, not part of the signal): negative" in result.summary
+    assert result.summary.endswith("Signal HOLD with 0% confidence.")
+
+
+@pytest.mark.parametrize("market_news", [
+    [],
+    market("KSE-100 sheds 1,000 points"),   # a market crash
+    market("KSE-100 gains in record rally"),
+])
+def test_market_news_never_changes_the_company_signal(agent, market_news):
+    own_news = [item(f"OGDC profit rises {i}", 1) for i in range(2)]
+    own_news += [item("Oil output falls", 2, "sector")]
+    baseline = agent.analyse(company(*own_news), as_of=NOW)
+    result = agent.analyse(company(*own_news, *market_news), as_of=NOW)
+
+    assert (result.signal, result.score, result.confidence, result.sentiment) == (
+        baseline.signal, baseline.score, baseline.confidence, baseline.sentiment)
+
+
+def test_market_crash_is_reported_alongside_good_company_news(agent):
+    result = agent.analyse(company(*[item(f"OGDC profit rises {i}", 0) for i in range(4)],
+                                   *market("KSE-100 sheds 1,000 points")), as_of=NOW)
+
+    assert (result.signal, result.sentiment) == (BUY, "positive")
+    assert "Market news (context only, not part of the signal): negative" in result.summary
+    assert any("Context only" in sentence for sentence in result.explanation)
+
+
+def test_decision_agent_treats_market_only_sentiment_as_no_evidence(agent):
+    from stockmind.agents.decision_making import DecisionMakingAgent
+
+    sentiment = agent.analyse(company(*market("KSE-100 sheds 1,000 points")), as_of=NOW)
+    decision = DecisionMakingAgent().combine(sentiment=sentiment)
+
+    row = decision.contributions.set_index("agent").loc["sentiment"]
+    assert (row["status"], row["effective_weight"]) == ("no evidence", 0.0)
+    assert (decision.signal, decision.confidence) == (HOLD, 0.0)
+
+    # Company news is evidence: Agent 5 uses it.
+    sentiment = agent.analyse(company(*[item(f"OGDC profit rises {i}", 0) for i in range(4)],
+                                      *market("KSE-100 sheds 1,000 points")), as_of=NOW)
+    decision = DecisionMakingAgent().combine(sentiment=sentiment)
+    assert decision.contributions.set_index("agent").at["sentiment", "status"] == "used"
+    assert decision.signal == BUY
